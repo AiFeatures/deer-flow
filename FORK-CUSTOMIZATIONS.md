@@ -1,6 +1,6 @@
 # Fork Customizations
 
-> This repository is a fork of [unknown]().
+> This repository is a fork of [bytedance/deer-flow](https://github.com/bytedance/deer-flow).
 > Managed under the [iAiFy Enterprise](https://github.com/enterprises/iAiFy) governance model.
 
 ## Purpose
@@ -11,7 +11,7 @@ An open-source SuperAgent harness that researches, codes, and creates. With the 
 
 | Property | Value |
 |----------|-------|
-| Upstream | [unknown]() |
+| Upstream | [bytedance/deer-flow](https://github.com/bytedance/deer-flow) |
 | Language | Python |
 | Fork org | AiFeatures |
 
