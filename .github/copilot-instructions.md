@@ -211,3 +211,8 @@ Only do broad repo searches (`grep/find/code search`) when:
 - you need file-level implementation details not listed here,
 - a command here fails and you need updated replacement behavior,
 - or CI/workflow definitions have changed since this file was written.
+
+## AgentHub Integration
+- Skills: `.agents/skills/` in this repo links to shared AgentHub skills
+- 14 shared agents available (api, architect, cli, deploy, developer, docker, docs, orchestrator, performance, refactor, reviewer, security, tester, troubleshoot)
+- MCP: 12 servers (GitHub, Supabase, Playwright, MongoDB, Notion, HuggingFace, etc.)
