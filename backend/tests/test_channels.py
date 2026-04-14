@@ -458,6 +458,62 @@ class TestChannelManager:
         _run(go())
 
     def test_handle_chat_creates_thread(self):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            mock_client = _make_mock_langgraph_client()
+            manager._client = mock_client
+
+            modified_msg = InboundMessage(
+                channel_name="test",
+                chat_id="chat1",
+                user_id="user1",
+                text="with /mnt/user-data/uploads/demo.png",
+                files=[{"image_key": "img_1"}],
+            )
+            mock_channel = MagicMock()
+            mock_channel.receive_file = AsyncMock(return_value=modified_msg)
+            mock_service = MagicMock()
+            mock_service.get_channel.return_value = mock_channel
+            monkeypatch.setattr("app.channels.service.get_channel_service", lambda: mock_service)
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="test",
+                chat_id="chat1",
+                user_id="user1",
+                text="hi [image]",
+                files=[{"image_key": "img_1"}],
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            mock_channel.receive_file.assert_awaited_once()
+            called_msg, called_thread_id = mock_channel.receive_file.await_args.args
+            assert called_msg.text == "hi [image]"
+            assert isinstance(called_thread_id, str)
+            assert called_thread_id
+
+            mock_client.runs.wait.assert_called_once()
+            run_call_args = mock_client.runs.wait.call_args
+            assert run_call_args[1]["input"]["messages"][0]["content"] == "with /mnt/user-data/uploads/demo.png"
+
+        _run(go())
+
+    def test_handle_chat_creates_thread(self):
         from src.channels.manager import ChannelManager
 
         async def go():
@@ -1804,6 +1860,45 @@ class TestSlackAllowedUsers:
         assert inbound.text == "hello from slack"
 
     def test_raises_after_all_retries_exhausted(self):
+        from app.channels.slack import SlackChannel
+
+        bus = MessageBus()
+        bus.publish_inbound = AsyncMock()
+        channel = SlackChannel(
+            bus=bus,
+            config={"allowed_users": [123456]},
+        )
+        channel._loop = MagicMock()
+        channel._loop.is_running.return_value = True
+        channel._add_reaction = MagicMock()
+        channel._send_running_reply = MagicMock()
+
+        event = {
+            "user": "123456",
+            "text": "hello from slack",
+            "channel": "C123",
+            "ts": "1710000000.000100",
+        }
+
+        def submit_coro(coro, loop):
+            coro.close()
+            return MagicMock()
+
+        with patch(
+            "app.channels.slack.asyncio.run_coroutine_threadsafe",
+            side_effect=submit_coro,
+        ) as submit:
+            channel._handle_message_event(event)
+
+        channel._add_reaction.assert_called_once_with("C123", "1710000000.000100", "eyes")
+        channel._send_running_reply.assert_called_once_with("C123", "1710000000.000100")
+        submit.assert_called_once()
+        inbound = bus.publish_inbound.call_args.args[0]
+        assert inbound.user_id == "123456"
+        assert inbound.chat_id == "C123"
+        assert inbound.text == "hello from slack"
+
+    def test_raises_after_all_retries_exhausted(self):
         from src.channels.slack import SlackChannel
 
         async def go():
@@ -1895,6 +1990,62 @@ class TestTelegramSendRetry:
         _run(go())
 
     def test_raises_runtime_error_when_no_attempts_configured(self):
+        from app.channels.telegram import TelegramChannel
+
+        async def go():
+            bus = MessageBus()
+            ch = TelegramChannel(bus=bus, config={"bot_token": "test-token"})
+            ch._application = MagicMock()
+
+            msg = OutboundMessage(channel_name="telegram", chat_id="12345", thread_id="t1", text="hello")
+            with pytest.raises(RuntimeError, match="without an exception"):
+                await ch.send(msg, _max_retries=0)
+
+        _run(go())
+
+
+class TestFeishuSendRetry:
+    def test_raises_runtime_error_when_no_attempts_configured(self):
+        from app.channels.feishu import FeishuChannel
+
+        async def go():
+            bus = MessageBus()
+            ch = FeishuChannel(bus=bus, config={"app_id": "id", "app_secret": "secret"})
+            ch._api_client = MagicMock()
+
+            msg = OutboundMessage(channel_name="feishu", chat_id="chat", thread_id="t1", text="hello")
+            with pytest.raises(RuntimeError, match="without an exception"):
+                await ch.send(msg, _max_retries=0)
+
+        _run(go())
+
+
+# ---------------------------------------------------------------------------
+# Telegram private-chat thread context tests
+# ---------------------------------------------------------------------------
+
+
+def _make_telegram_update(chat_type: str, message_id: int, *, reply_to_message_id: int | None = None, text: str = "hello"):
+    """Build a minimal mock telegram Update for testing _on_text / _cmd_generic."""
+    update = MagicMock()
+    update.effective_chat.type = chat_type
+    update.effective_chat.id = 100
+    update.effective_user.id = 42
+    update.message.text = text
+    update.message.message_id = message_id
+    if reply_to_message_id is not None:
+        reply_msg = MagicMock()
+        reply_msg.message_id = reply_to_message_id
+        update.message.reply_to_message = reply_msg
+    else:
+        update.message.reply_to_message = None
+    return update
+
+
+class TestTelegramPrivateChatThread:
+    """Verify that private chats use topic_id=None (single thread per chat)."""
+
+    def test_private_chat_no_reply_uses_none_topic(self):
         from app.channels.telegram import TelegramChannel
 
         async def go():
