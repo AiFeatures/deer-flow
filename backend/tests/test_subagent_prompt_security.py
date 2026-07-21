@@ -25,7 +25,9 @@ def test_build_subagent_section_hides_bash_examples_when_unavailable(monkeypatch
 
     section = prompt_module._build_subagent_section(3)
 
-    assert "Not available in the current sandbox configuration" in section
+    # When bash is not available, it should not appear at all (aligned with Codex:
+    # unavailable roles are omitted, not listed as disabled)
+    assert "**bash**" not in section
     assert 'bash("npm test")' not in section
     assert 'read_file("/mnt/user-data/workspace/README.md")' in section
     assert "available tools (ls, read_file, web_search, etc.)" in section
@@ -53,3 +55,17 @@ def test_general_purpose_subagent_prompt_mentions_workspace_relative_paths() -> 
 
     assert "Treat `/mnt/user-data/workspace` as the default working directory for coding and file IO" in GENERAL_PURPOSE_CONFIG.system_prompt
     assert "`hello.txt`, `../uploads/input.csv`, and `../outputs/result.md`" in GENERAL_PURPOSE_CONFIG.system_prompt
+
+
+def test_general_purpose_subagent_prompt_prohibits_task_tool() -> None:
+    """The system prompt must explicitly tell the LLM that `task` is unavailable.
+
+    Without this, subagents may attempt to call `task` after seeing the parent
+    agent use it, triggering a LangGraph tool validation error (#4159).
+    """
+    from deerflow.subagents.builtins.general_purpose import GENERAL_PURPOSE_CONFIG
+
+    prompt = GENERAL_PURPOSE_CONFIG.system_prompt
+    assert "task" in prompt.lower()
+    assert "NOT available" in prompt or "must NEVER" in prompt
+    assert "disallowed_tools" not in prompt  # don't leak internal implementation details

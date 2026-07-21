@@ -76,11 +76,10 @@ def _count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
 - Provides exact token counts for budget management
 - Falls back to character-based estimation if tiktoken fails
 
-### Benefits
-- **Precision**: Exact token counts match what the model sees
-- **Budget Optimization**: Maximizes use of available token budget
-- **No Overflows**: Prevents exceeding `max_injection_tokens` limit
-- **Better Planning**: Each section's token cost is known precisely
+Token counting:
+- Uses `tiktoken` (`cl100k_base`) when available
+- Falls back to a network-free CJK-aware character estimate if tokenizer import or encoding load fails
+  (CJK characters count as ~2 chars/token, other characters as ~4 chars/token)
 
 ### Example
 ```python
