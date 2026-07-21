@@ -19,6 +19,8 @@ import logging
 import re
 from pathlib import Path
 
+from deerflow.config.app_config import get_app_config
+
 logger = logging.getLogger(__name__)
 
 # File extensions that should be converted to markdown
@@ -133,7 +135,7 @@ def _do_convert(file_path: Path, pdf_converter: str) -> str:
     return _convert_with_markitdown(file_path)
 
 
-async def convert_file_to_markdown(file_path: Path) -> Path | None:
+async def convert_file_to_markdown(file_path: Path, output_path: Path | None = None) -> Path | None:
     """Convert a supported document file to Markdown.
 
     PDF files are handled with a two-converter strategy (see module docstring).
@@ -142,6 +144,10 @@ async def convert_file_to_markdown(file_path: Path) -> Path | None:
 
     Args:
         file_path: Path to the file to convert.
+        output_path: Optional destination for the generated ``.md`` file.
+            When omitted, writes to ``file_path`` with a ``.md`` suffix.
+            Callers that track per-request filename uniqueness should pass a
+            pre-claimed path so companion markdown cannot clobber other uploads.
 
     Returns:
         Path to the generated .md file, or None if conversion failed.
@@ -155,7 +161,7 @@ async def convert_file_to_markdown(file_path: Path) -> Path | None:
         else:
             text = _do_convert(file_path, pdf_converter)
 
-        md_path = file_path.with_suffix(".md")
+        md_path = output_path if output_path is not None else file_path.with_suffix(".md")
         md_path.write_text(text, encoding="utf-8")
 
         logger.info("Converted %s to markdown: %s (%d chars)", file_path.name, md_path.name, len(text))
@@ -277,13 +283,26 @@ def extract_outline(md_path: Path) -> list[dict]:
                     if title:
                         outline.append({"title": title, "line": lineno})
 
-                if len(outline) >= MAX_OUTLINE_ENTRIES:
+                if len(outline) > MAX_OUTLINE_ENTRIES:
+                    # We collected one heading beyond the limit, which proves the
+                    # document genuinely has more than MAX_OUTLINE_ENTRIES headings.
+                    # Drop that extra entry and append the truncation sentinel.
+                    outline.pop()
                     outline.append({"truncated": True})
                     break
     except Exception:
         return []
 
     return outline
+
+
+def _get_uploads_config_value(key: str, default: object) -> object:
+    """Read a value from the uploads config, supporting dict and attribute access."""
+    cfg = get_app_config()
+    uploads_cfg = getattr(cfg, "uploads", None)
+    if isinstance(uploads_cfg, dict):
+        return uploads_cfg.get(key, default)
+    return getattr(uploads_cfg, key, default)
 
 
 def _get_pdf_converter() -> str:
@@ -294,16 +313,11 @@ def _get_pdf_converter() -> str:
     fall through to unexpected behaviour.
     """
     try:
-        from deerflow.config.app_config import get_app_config
-
-        cfg = get_app_config()
-        uploads_cfg = getattr(cfg, "uploads", None)
-        if uploads_cfg is not None:
-            raw = str(getattr(uploads_cfg, "pdf_converter", "auto")).strip().lower()
-            if raw not in _ALLOWED_PDF_CONVERTERS:
-                logger.warning("Invalid pdf_converter value %r; falling back to 'auto'", raw)
-                return "auto"
-            return raw
+        raw = str(_get_uploads_config_value("pdf_converter", "auto")).strip().lower()
+        if raw not in _ALLOWED_PDF_CONVERTERS:
+            logger.warning("Invalid pdf_converter value %r; falling back to 'auto'", raw)
+            return "auto"
+        return raw
     except Exception:
         pass
     return "auto"
