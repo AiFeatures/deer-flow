@@ -19,15 +19,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 # Break the circular import chain that exists in production code:
-#   src.subagents.__init__
+#   deerflow.subagents.__init__
 #     -> .executor (SubagentExecutor, SubagentResult)
-#       -> src.agents.thread_state
-#         -> src.agents.__init__
+#       -> deerflow.agents.thread_state
+#         -> deerflow.agents.__init__
 #           -> lead_agent.agent
 #             -> subagent_limit_middleware
-#               -> src.subagents.executor  <-- circular!
+#               -> deerflow.subagents.executor  <-- circular!
 #
-# By injecting a mock for src.subagents.executor *before* any test module
+# By injecting a mock for deerflow.subagents.executor *before* any test module
 # triggers the import, __init__.py's "from .executor import ..." succeeds
 # immediately without running the real executor module.
 _executor_mock = MagicMock()

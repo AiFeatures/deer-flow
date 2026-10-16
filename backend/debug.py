@@ -3,6 +3,12 @@
 Debug script for lead_agent.
 Run this file directly in VS Code with breakpoints.
 
+Requirements:
+    Run with `uv run` from the backend/ directory so that the uv workspace
+    resolves deerflow-harness and app packages correctly:
+
+        cd backend && PYTHONPATH=. uv run python debug.py
+
 Usage:
     1. Set breakpoints in agent.py or other files
     2. Press F5 or use "Run and Debug" panel
@@ -11,13 +17,7 @@ Usage:
 
 import asyncio
 import logging
-import os
-import sys
 
-# Ensure we can import from src
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# Load environment variables
 from dotenv import load_dotenv
 
 from deerflow.env import load_selected_env_file

@@ -19,7 +19,7 @@ from deerflow.config.subagents_config import (
     get_subagents_app_config,
     load_subagents_config_from_dict,
 )
-from src.subagents.config import SubagentConfig
+from deerflow.subagents.config import SubagentConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -375,12 +375,12 @@ class TestRegistryGetSubagentConfig:
         _reset_subagents_config()
 
     def test_returns_none_for_unknown_agent(self):
-        from src.subagents.registry import get_subagent_config
+        from deerflow.subagents.registry import get_subagent_config
 
         assert get_subagent_config("nonexistent") is None
 
     def test_returns_config_for_builtin_agents(self):
-        from src.subagents.registry import get_subagent_config
+        from deerflow.subagents.registry import get_subagent_config
 
         assert get_subagent_config("general-purpose") is not None
         assert get_subagent_config("bash") is not None
@@ -411,7 +411,7 @@ class TestRegistryGetSubagentConfig:
         assert get_subagent_config("bash").max_turns == 60
 
     def test_global_timeout_override_applied(self):
-        from src.subagents.registry import get_subagent_config
+        from deerflow.subagents.registry import get_subagent_config
 
         _reset_subagents_config(timeout_seconds=1800, max_turns=140)
         config = get_subagent_config("general-purpose")
@@ -433,7 +433,7 @@ class TestRegistryGetSubagentConfig:
         assert bash_config.max_turns == 80
 
     def test_per_agent_override_does_not_affect_other_agents(self):
-        from src.subagents.registry import get_subagent_config
+        from deerflow.subagents.registry import get_subagent_config
 
         load_subagents_config_from_dict(
             {
@@ -539,8 +539,8 @@ class TestRegistryGetSubagentConfig:
 
     def test_builtin_config_object_is_not_mutated(self):
         """Registry must return a new object, leaving the builtin default intact."""
-        from src.subagents.builtins import BUILTIN_SUBAGENTS
-        from src.subagents.registry import get_subagent_config
+        from deerflow.subagents.builtins import BUILTIN_SUBAGENTS
+        from deerflow.subagents.registry import get_subagent_config
 
         original_timeout = BUILTIN_SUBAGENTS["bash"].timeout_seconds
         original_max_turns = BUILTIN_SUBAGENTS["bash"].max_turns
@@ -579,14 +579,14 @@ class TestRegistryListSubagents:
         _reset_subagents_config()
 
     def test_lists_both_builtin_agents(self):
-        from src.subagents.registry import list_subagents
+        from deerflow.subagents.registry import list_subagents
 
         names = {cfg.name for cfg in list_subagents()}
         assert "general-purpose" in names
         assert "bash" in names
 
     def test_all_returned_configs_get_global_override(self):
-        from src.subagents.registry import list_subagents
+        from deerflow.subagents.registry import list_subagents
 
         _reset_subagents_config(timeout_seconds=123, max_turns=77)
         for cfg in list_subagents():
@@ -594,7 +594,7 @@ class TestRegistryListSubagents:
             assert cfg.max_turns == 77, f"{cfg.name} has wrong max_turns"
 
     def test_per_agent_overrides_reflected_in_list(self):
-        from src.subagents.registry import list_subagents
+        from deerflow.subagents.registry import list_subagents
 
         load_subagents_config_from_dict(
             {

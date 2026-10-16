@@ -24,6 +24,7 @@ export interface ModelReasoningCapabilities {
 export interface Model {
   id: string;
   name: string;
+  model: string;
   display_name: string;
   description?: string | null;
   /** @deprecated derived from `reasoning`; kept for older Gateways. */

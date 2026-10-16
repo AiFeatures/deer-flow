@@ -1,5 +1,7 @@
 """Tests for DeerFlowClient."""
 
+import asyncio
+import concurrent.futures
 import json
 import os
 import shutil
@@ -48,6 +50,7 @@ def mock_app_config():
     """Provide a minimal AppConfig mock."""
     model = MagicMock()
     model.name = "test-model"
+    model.model = "test-model"
     model.supports_thinking = False
     model.supports_reasoning_effort = False
     model.model_dump.return_value = {"name": "test-model", "use": "langchain_openai:ChatOpenAI"}
@@ -130,8 +133,8 @@ class TestClientInit:
 
     def test_custom_config_path(self, mock_app_config):
         with (
-            patch("src.client.reload_app_config") as mock_reload,
-            patch("src.client.get_app_config", return_value=mock_app_config),
+            patch("deerflow.client.reload_app_config") as mock_reload,
+            patch("deerflow.client.get_app_config", return_value=mock_app_config),
         ):
             DeerFlowClient(config_path="/tmp/custom.yaml")
             mock_reload.assert_called_once_with("/tmp/custom.yaml")
@@ -148,7 +151,7 @@ class TestClientInit:
 
     def test_checkpointer_stored(self, mock_app_config):
         cp = MagicMock()
-        with patch("src.client.get_app_config", return_value=mock_app_config):
+        with patch("deerflow.client.get_app_config", return_value=mock_app_config):
             c = DeerFlowClient(checkpointer=cp)
         assert c._checkpointer is cp
 
@@ -201,6 +204,7 @@ class TestConfigQueries:
         assert len(result["models"]) == 1
         assert result["models"][0]["name"] == "test-model"
         # Verify Gateway-aligned fields are present
+        assert "model" in result["models"][0]
         assert "display_name" in result["models"][0]
         assert "supports_thinking" in result["models"][0]
         # The normalized reasoning contract is projected beside the legacy booleans.
@@ -2183,6 +2187,7 @@ class TestGetModel:
     def test_found(self, client):
         model_cfg = MagicMock()
         model_cfg.name = "test-model"
+        model_cfg.model = "test-model"
         model_cfg.display_name = "Test Model"
         model_cfg.description = "A test model"
         model_cfg.supports_thinking = True
@@ -2192,6 +2197,7 @@ class TestGetModel:
         result = client.get_model("test-model")
         assert result == {
             "name": "test-model",
+            "model": "test-model",
             "display_name": "Test Model",
             "description": "A test model",
             "supports_thinking": True,
@@ -2612,7 +2618,7 @@ class TestMcpConfig:
         ext_config = MagicMock()
         ext_config.mcp_servers = {"github": server}
 
-        with patch("src.client.get_extensions_config", return_value=ext_config):
+        with patch("deerflow.client.get_extensions_config", return_value=ext_config):
             result = client.get_mcp_config()
 
         assert "mcp_servers" in result
@@ -2634,9 +2640,9 @@ class TestMcpConfig:
             client._agent = MagicMock()
 
             with (
-                patch("src.client.ExtensionsConfig.resolve_config_path", return_value=tmp_path),
-                patch("src.client.get_extensions_config", return_value=current_config),
-                patch("src.client.reload_extensions_config", return_value=reloaded_config),
+                patch("deerflow.client.ExtensionsConfig.resolve_config_path", return_value=tmp_path),
+                patch("deerflow.client.get_extensions_config", return_value=current_config),
+                patch("deerflow.client.reload_extensions_config", return_value=reloaded_config),
             ):
                 result = client.update_mcp_config({"new-server": {"enabled": True, "type": "sse"}})
 
@@ -3010,7 +3016,7 @@ class TestMemoryManagement:
         config.manager_class = "deermem"
         config.backend_config = {}
 
-        with patch("src.config.memory_config.get_memory_config", return_value=config):
+        with patch("deerflow.config.memory_config.get_memory_config", return_value=config):
             result = client.get_memory_config()
 
         assert result["enabled"] is True
@@ -3687,6 +3693,7 @@ class TestScenarioConfigManagement:
         # Get specific model
         model_cfg = MagicMock()
         model_cfg.name = model_name
+        model_cfg.model = model_name
         model_cfg.display_name = None
         model_cfg.description = None
         model_cfg.supports_thinking = False
@@ -3726,9 +3733,9 @@ class TestScenarioConfigManagement:
 
             client._agent = MagicMock()  # Simulate existing agent
             with (
-                patch("src.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
-                patch("src.client.get_extensions_config", return_value=current_config),
-                patch("src.client.reload_extensions_config", return_value=reloaded_config),
+                patch("deerflow.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
+                patch("deerflow.client.get_extensions_config", return_value=current_config),
+                patch("deerflow.client.reload_extensions_config", return_value=reloaded_config),
             ):
                 mcp_result = client.update_mcp_config({"my-mcp": {"enabled": True}})
             assert "my-mcp" in mcp_result["mcp_servers"]
@@ -4208,6 +4215,7 @@ class TestGatewayConformance:
     def test_list_models(self, mock_app_config):
         model = MagicMock()
         model.name = "test-model"
+        model.model = "gpt-test"
         model.display_name = "Test Model"
         model.description = "A test model"
         model.supports_thinking = False
@@ -4215,7 +4223,7 @@ class TestGatewayConformance:
         mock_app_config.models = [model]
         mock_app_config.token_usage.enabled = True
 
-        with patch("src.client.get_app_config", return_value=mock_app_config):
+        with patch("deerflow.client.get_app_config", return_value=mock_app_config):
             client = DeerFlowClient()
 
         result = client.list_models()
@@ -4228,19 +4236,21 @@ class TestGatewayConformance:
     def test_get_model(self, mock_app_config):
         model = MagicMock()
         model.name = "test-model"
+        model.model = "gpt-test"
         model.display_name = "Test Model"
         model.description = "A test model"
         model.supports_thinking = True
         mock_app_config.models = [model]
         mock_app_config.get_model_config.return_value = model
 
-        with patch("src.client.get_app_config", return_value=mock_app_config):
+        with patch("deerflow.client.get_app_config", return_value=mock_app_config):
             client = DeerFlowClient()
 
         result = client.get_model("test-model")
         assert result is not None
         parsed = ModelResponse(**result)
         assert parsed.name == "test-model"
+        assert parsed.model == "gpt-test"
 
     def test_list_skills(self, client):
         skill = MagicMock()
@@ -4309,7 +4319,7 @@ class TestGatewayConformance:
         ext_config = MagicMock()
         ext_config.mcp_servers = {"test": server}
 
-        with patch("src.client.get_extensions_config", return_value=ext_config):
+        with patch("deerflow.client.get_extensions_config", return_value=ext_config):
             result = client.get_mcp_config()
 
         parsed = McpConfigResponse(**result)
@@ -4332,9 +4342,9 @@ class TestGatewayConformance:
         config_file.write_text("{}")
 
         with (
-            patch("src.client.get_extensions_config", return_value=ext_config),
-            patch("src.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
-            patch("src.client.reload_extensions_config", return_value=ext_config),
+            patch("deerflow.client.get_extensions_config", return_value=ext_config),
+            patch("deerflow.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
+            patch("deerflow.client.reload_extensions_config", return_value=ext_config),
         ):
             result = client.update_mcp_config({"srv": server.model_dump()})
 
@@ -4376,7 +4386,7 @@ class TestGatewayConformance:
         mem_cfg.manager_class = "deermem"
         mem_cfg.backend_config = {}
 
-        with patch("src.config.memory_config.get_memory_config", return_value=mem_cfg):
+        with patch("deerflow.config.memory_config.get_memory_config", return_value=mem_cfg):
             result = client.get_memory_config()
 
         parsed = MemoryConfigResponse(**result)

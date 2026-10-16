@@ -390,7 +390,8 @@ class TestTitleMiddlewareCoreLogic:
                 AIMessage(content="好的，先确认需求"),
             ]
         }
-        title = asyncio.run(middleware._generate_title(state))
+        result = asyncio.run(middleware._agenerate_title_result(state))
+        title = result["title"]
 
         assert title == "短标题"
         title_middleware_module.create_chat_model.assert_called_once_with(name="title-model", thinking_enabled=False, attach_tracing=False)
@@ -474,7 +475,8 @@ class TestTitleMiddlewareCoreLogic:
                 AIMessage(content="收到"),
             ]
         }
-        title = asyncio.run(middleware._generate_title(state))
+        result = asyncio.run(middleware._agenerate_title_result(state))
+        title = result["title"]
 
         # Assert behavior (truncated fallback + ellipsis) without overfitting exact text.
         assert title.endswith("...")
@@ -483,14 +485,12 @@ class TestTitleMiddlewareCoreLogic:
     def test_aafter_model_delegates_to_async_helper(self, monkeypatch):
         _set_test_title_config(model_name="title-model")
         middleware = TitleMiddleware()
-        monkeypatch.setattr(middleware, "_should_generate_title", lambda state: True)
-        monkeypatch.setattr(middleware, "_generate_title", AsyncMock(return_value="核心逻辑回归"))
 
+        monkeypatch.setattr(middleware, "_agenerate_title_result", AsyncMock(return_value={"title": "异步标题"}))
         result = asyncio.run(middleware.aafter_model({"messages": []}, runtime=MagicMock()))
+        assert result == {"title": "异步标题"}
 
-        assert result == {"title": "核心逻辑回归"}
-
-        monkeypatch.setattr(middleware, "_should_generate_title", lambda state: False)
+        monkeypatch.setattr(middleware, "_agenerate_title_result", AsyncMock(return_value=None))
         assert asyncio.run(middleware.aafter_model({"messages": []}, runtime=MagicMock())) is None
 
     def test_aafter_model_uses_local_fallback_when_no_title_model_is_configured(self, monkeypatch):

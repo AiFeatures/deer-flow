@@ -4,8 +4,8 @@ import logging
 
 import pytest
 
-from src.config.extensions_config import ExtensionsConfig, McpServerConfig
-from src.mcp.client import build_server_params, build_servers_config
+from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig
+from deerflow.mcp.client import build_server_params, build_servers_config
 
 
 def test_build_server_params_stdio_success():

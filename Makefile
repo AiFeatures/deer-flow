@@ -29,6 +29,7 @@ help:
 	@echo "  make doctor          - Check configuration and system requirements"
 	@echo "  make support-bundle  - Create a redacted issue summary, AI draft, and evidence bundle"
 	@echo "  make config          - Generate local config files (aborts if config already exists)"
+	@echo "  make config-upgrade  - Merge new fields from config.example.yaml into config.yaml"
 	@echo "  make check           - Check if all required tools are installed"
 	@echo "  make check-agent-guidance - Validate scoped AGENTS.md file and chain budgets"
 	@echo "  make detect-thread-boundaries - Inventory backend executor/thread/event-loop boundaries"
@@ -58,7 +59,7 @@ help:
 	@echo "  make down            - Stop and remove production Docker containers"
 	@echo ""
 	@echo "Docker Development Commands:"
-	@echo "  make docker-init     - Build the custom k3s image (with pre-cached sandbox image)"
+	@echo "  make docker-init     - Pull the sandbox image"
 	@echo "  make docker-start    - Start Docker services (mode-aware from config.yaml, localhost:2026)"
 	@echo "  make docker-stop     - Stop Docker development services"
 	@echo "  make docker-logs     - View Docker development logs"
@@ -90,78 +91,7 @@ config-upgrade:
 
 # Check required tools
 check:
-	@echo "=========================================="
-	@echo "  Checking Required Dependencies"
-	@echo "=========================================="
-	@echo ""
-	@FAILED=0; \
-	echo "Checking Node.js..."; \
-	if command -v node >/dev/null 2>&1; then \
-		NODE_VERSION=$$(node -v | sed 's/v//'); \
-		NODE_MAJOR=$$(echo $$NODE_VERSION | cut -d. -f1); \
-		if [ $$NODE_MAJOR -ge 22 ]; then \
-			echo "  ✓ Node.js $$NODE_VERSION (>= 22 required)"; \
-		else \
-			echo "  ✗ Node.js $$NODE_VERSION found, but version 22+ is required"; \
-			echo "    Install from: https://nodejs.org/"; \
-			FAILED=1; \
-		fi; \
-	else \
-		echo "  ✗ Node.js not found (version 22+ required)"; \
-		echo "    Install from: https://nodejs.org/"; \
-		FAILED=1; \
-	fi; \
-	echo ""; \
-	echo "Checking pnpm..."; \
-	if command -v pnpm >/dev/null 2>&1; then \
-		PNPM_VERSION=$$(pnpm -v); \
-		echo "  ✓ pnpm $$PNPM_VERSION"; \
-	else \
-		echo "  ✗ pnpm not found"; \
-		echo "    Install: npm install -g pnpm"; \
-		echo "    Or visit: https://pnpm.io/installation"; \
-		FAILED=1; \
-	fi; \
-	echo ""; \
-	echo "Checking uv..."; \
-	if command -v uv >/dev/null 2>&1; then \
-		UV_VERSION=$$(uv --version | awk '{print $$2}'); \
-		echo "  ✓ uv $$UV_VERSION"; \
-	else \
-		echo "  ✗ uv not found"; \
-		echo "    Install: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
-		echo "    Or visit: https://docs.astral.sh/uv/getting-started/installation/"; \
-		FAILED=1; \
-	fi; \
-	echo ""; \
-	echo "Checking nginx..."; \
-	if command -v nginx >/dev/null 2>&1; then \
-		NGINX_VERSION=$$(nginx -v 2>&1 | awk -F'/' '{print $$2}'); \
-		echo "  ✓ nginx $$NGINX_VERSION"; \
-	else \
-		echo "  ✗ nginx not found"; \
-		echo "    macOS:   brew install nginx"; \
-		echo "    Ubuntu:  sudo apt install nginx"; \
-		echo "    Or visit: https://nginx.org/en/download.html"; \
-		FAILED=1; \
-	fi; \
-	echo ""; \
-	if [ $$FAILED -eq 0 ]; then \
-		echo "=========================================="; \
-		echo "  ✓ All dependencies are installed!"; \
-		echo "=========================================="; \
-		echo ""; \
-		echo "You can now run:"; \
-		echo "  make install  - Install project dependencies"; \
-		echo "  make dev      - Start development server"; \
-	else \
-		echo "=========================================="; \
-		echo "  ✗ Some dependencies are missing"; \
-		echo "=========================================="; \
-		echo ""; \
-		echo "Please install the missing tools and run 'make check' again."; \
-		exit 1; \
-	fi
+	@$(PYTHON) ./scripts/check.py
 
 check-agent-guidance:
 	@$(PYTHON) ./scripts/check_agent_guidance.py
@@ -217,7 +147,7 @@ extension-remove:
 setup-sandbox:
 	@$(RUN_SHELL_SCRIPT) ./scripts/setup-sandbox.sh
 
-# Start all services
+# Start all services in development mode (with hot-reloading)
 dev:
 	@$(PYTHON) ./scripts/check.py
 	@$(RUN_SHELL_SCRIPT) ./scripts/serve.sh --dev

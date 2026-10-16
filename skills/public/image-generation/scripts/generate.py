@@ -338,7 +338,7 @@ def generate_image(
     output_file: str,
     aspect_ratio: str = "16:9",
 ) -> str:
-    with open(prompt_file, "r") as f:
+    with open(prompt_file, "r", encoding="utf-8") as f:
         prompt = f.read()
     provider = _resolve_provider(
         "IMAGE_GENERATION_PROVIDER", "gemini", bool(os.getenv("GEMINI_API_KEY"))

@@ -142,10 +142,7 @@ export async function uploadFiles(
   );
 
   if (!response.ok) {
-    const error = await response
-      .json()
-      .catch(() => ({ detail: "Upload failed" }));
-    throw new Error(error.detail ?? "Upload failed");
+    throw new Error(await readErrorDetail(response, "Upload failed"));
   }
 
   return response.json();
@@ -179,7 +176,9 @@ export async function listUploadedFiles(
   );
 
   if (!response.ok) {
-    throw new Error("Failed to list uploaded files");
+    throw new Error(
+      await readErrorDetail(response, "Failed to list uploaded files"),
+    );
   }
 
   return response.json();
@@ -201,7 +200,7 @@ export async function deleteUploadedFile(
   );
 
   if (!response.ok) {
-    throw new Error("Failed to delete file");
+    throw new Error(await readErrorDetail(response, "Failed to delete file"));
   }
 
   return response.json();

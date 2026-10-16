@@ -29,10 +29,12 @@ from deerflow.runtime.store.provider import POSTGRES_STORE_INSTALL
 @pytest.fixture(autouse=True)
 def reset_state():
     """Reset singleton state before each test."""
+    app_config_module._app_config = None
     set_checkpointer_config(None)
     reset_checkpointer()
     reset_store()
     yield
+    app_config_module._app_config = None
     set_checkpointer_config(None)
     reset_checkpointer()
     reset_store()
@@ -1327,7 +1329,7 @@ class TestClientCheckpointerFallback:
         """DeerFlowClient._ensure_agent falls back to get_checkpointer() when checkpointer=None."""
         from langgraph.checkpoint.memory import InMemorySaver
 
-        from src.client import DeerFlowClient
+        from deerflow.client import DeerFlowClient
 
         load_checkpointer_config_from_dict({"type": "memory"})
 
@@ -1366,7 +1368,7 @@ class TestClientCheckpointerFallback:
 
     def test_client_explicit_checkpointer_takes_precedence(self):
         """An explicitly provided checkpointer is used even when config checkpointer is set."""
-        from src.client import DeerFlowClient
+        from deerflow.client import DeerFlowClient
 
         load_checkpointer_config_from_dict({"type": "memory"})
 

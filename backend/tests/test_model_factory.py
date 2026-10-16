@@ -1,4 +1,4 @@
-"""Tests for src.models.factory.create_chat_model."""
+"""Tests for deerflow.models.factory.create_chat_model."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from deerflow.reflection import resolve_class
 def _make_app_config(models: list[ModelConfig]) -> AppConfig:
     return AppConfig(
         models=models,
-        sandbox=SandboxConfig(use="src.sandbox.local:LocalSandboxProvider"),
+        sandbox=SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider"),
     )
 
 
@@ -37,6 +37,7 @@ def _make_model(
     when_thinking_enabled: dict | None = None,
     when_thinking_disabled: dict | None = None,
     thinking: dict | None = None,
+    max_tokens: int | None = None,
 ) -> ModelConfig:
     return ModelConfig(
         name=name,
@@ -44,6 +45,7 @@ def _make_model(
         description=None,
         use=use,
         model=name,
+        max_tokens=max_tokens,
         supports_thinking=supports_thinking,
         supports_reasoning_effort=supports_reasoning_effort,
         when_thinking_enabled=when_thinking_enabled,
