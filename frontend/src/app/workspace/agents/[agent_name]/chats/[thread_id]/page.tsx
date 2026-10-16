@@ -2,20 +2,27 @@
 
 import { BotIcon, PlusSquare } from "lucide-react";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { PromptInputMessage } from "@/components/ai-elements/prompt-input";
 import { Button } from "@/components/ui/button";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AgentWelcome } from "@/components/workspace/agent-welcome";
 import { ArtifactTrigger } from "@/components/workspace/artifacts";
-import { ChatBox, useThreadChat } from "@/components/workspace/chats";
+import { BrowserTrigger } from "@/components/workspace/browser-view";
+import {
+  ChatBox,
+  useMarkOpenThreadRead,
+  useThreadChat,
+} from "@/components/workspace/chats";
+import { ContextUsageBadge } from "@/components/workspace/context-usage-badge";
 import { ExportTrigger } from "@/components/workspace/export-trigger";
 import { GoalStatus } from "@/components/workspace/goal-status";
 import {
   InputBox,
   type InputBoxSubmitOptions,
 } from "@/components/workspace/input-box";
+import { KnowledgeScopeSelector } from "@/components/workspace/knowledge-scope-selector";
 import {
   MessageList,
   MESSAGE_LIST_DEFAULT_PADDING_BOTTOM,
@@ -25,13 +32,29 @@ import {
   SidecarProvider,
   SidecarTrigger,
 } from "@/components/workspace/sidecar";
+import { ThreadArchiveStatus } from "@/components/workspace/thread-archive-status";
+import { ThreadBackgroundTasks } from "@/components/workspace/thread-background-tasks";
+import { ThreadExtensionActions } from "@/components/workspace/thread-extension-actions";
+import { ThreadSubagentBatches } from "@/components/workspace/thread-subagent-batches";
 import { ThreadTitle } from "@/components/workspace/thread-title";
 import { TodoList } from "@/components/workspace/todo-list";
 import { TokenUsageIndicator } from "@/components/workspace/token-usage-indicator";
 import { Tooltip } from "@/components/workspace/tooltip";
 import { useActiveGoal } from "@/components/workspace/use-active-goal";
 import { useAgent } from "@/core/agents";
+import { useAuth } from "@/core/auth/AuthProvider";
+import { hasPermission, PERMISSIONS } from "@/core/auth/permissions";
+import {
+  useBrowserControlEnabled,
+  useKnowledgeBaseEnabled,
+} from "@/core/features";
 import { useI18n } from "@/core/i18n/hooks";
+import {
+  knowledgeScopeToSelection,
+  buildKnowledgeScopeSnapshot,
+  KNOWLEDGE_SCOPE_KEY,
+  type KnowledgeScopeSelection,
+} from "@/core/knowledge";
 import {
   buildHumanInputResponseText,
   hasOpenHumanInputRequest,
@@ -41,26 +64,34 @@ import {
 import { isHiddenFromUIMessage } from "@/core/messages/utils";
 import { useModels } from "@/core/models/hooks";
 import { useNotification } from "@/core/notification/hooks";
+import { useThreadScheduledTaskEvents } from "@/core/scheduled-tasks/events";
 import { useLocalSettings, useThreadSettings } from "@/core/settings";
+import { resolveThreadContext } from "@/core/settings/store";
 import {
   useThreadMetadata,
   useThreadStream,
   useThreadTokenUsage,
 } from "@/core/threads/hooks";
-import { threadTokenUsageToTokenUsage } from "@/core/threads/token-usage";
-import { textOfMessage } from "@/core/threads/utils";
+import {
+  selectContextUsage,
+  threadTokenUsageToTokenUsage,
+} from "@/core/threads/token-usage";
+import { projectIdOfThread, textOfMessage } from "@/core/threads/utils";
 import { env } from "@/env";
 import { cn } from "@/lib/utils";
 
 export default function AgentChatPage() {
   const { t } = useI18n();
+  const { user } = useAuth();
+  const canStopStreaming = hasPermission(user, PERMISSIONS.RUNS_CANCEL);
+  const canCreateRuns = hasPermission(user, PERMISSIONS.RUNS_CREATE);
   const router = useRouter();
 
   const { agent_name } = useParams<{
     agent_name: string;
   }>();
 
-  const { agent } = useAgent(agent_name);
+  const { agent, isLoading: agentSkillsLoading } = useAgent(agent_name);
 
   const { threadId, setThreadId, isNewThread, setIsNewThread, isMock } =
     useThreadChat();
@@ -70,18 +101,77 @@ export default function AgentChatPage() {
   const [isWelcomeMode, setIsWelcomeMode] = useState(isNewThread);
   const [settings, setSettings] = useThreadSettings(threadId);
   const [localSettings, setLocalSettings] = useLocalSettings();
+  const { enabled: browserControlEnabled } = useBrowserControlEnabled();
+  const { scopeSelectionEnabled } = useKnowledgeBaseEnabled();
   const { tokenUsageEnabled } = useModels();
   const threadTokenUsage = useThreadTokenUsage(
     isNewThread || isMock ? undefined : threadId,
-    { enabled: tokenUsageEnabled && !isMock },
+    { enabled: !isMock },
   );
   const threadMetadata = useThreadMetadata(threadId, {
     enabled: !isNewThread && !isMock,
     isMock,
   });
+  // A saved thread that exists on the server is being read while open:
+  // clears its unread dot (sidebar and chats list) on every device.
+  const markThreadRead = useMarkOpenThreadRead(threadId, {
+    enabled: !isNewThread && !isMock && threadMetadata.data != null,
+  });
+  // Lifecycle lines of schedules created in this chat ("Paused by agent",
+  // "Finished"); they stay after the task is deleted.
+  const scheduledTaskEvents = useThreadScheduledTaskEvents(threadId, {
+    isNewThread,
+    enabled: !isMock,
+  });
   const backendTokenUsage = threadTokenUsageToTokenUsage(threadTokenUsage.data);
+  const contextUsage = selectContextUsage(threadTokenUsage.data);
 
   const { showNotification } = useNotification();
+  const selectorVisible =
+    scopeSelectionEnabled && env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true";
+  const agentKnowledgeEnabled =
+    agent !== null &&
+    (agent.tool_groups == null || agent.tool_groups.includes("knowledge"));
+  const [knowledgeScopeOverride, setKnowledgeScope] =
+    useState<KnowledgeScopeSelection | null>(null);
+  const previousConversationRef = useRef({
+    agentName: agent_name,
+    threadId,
+    isNewThread,
+  });
+
+  const knowledgeScope = useMemo(
+    () =>
+      knowledgeScopeOverride ??
+      knowledgeScopeToSelection(agent?.knowledge_scope),
+    [knowledgeScopeOverride, agent?.knowledge_scope],
+  );
+
+  useEffect(() => {
+    const previous = previousConversationRef.current;
+    if (previous.agentName !== agent_name || previous.threadId !== threadId) {
+      const isNewThreadRouteReplacement =
+        previous.agentName === agent_name &&
+        previous.isNewThread &&
+        !isNewThread;
+      if (!isNewThreadRouteReplacement) {
+        setKnowledgeScope(null);
+      }
+    }
+    previousConversationRef.current = {
+      agentName: agent_name,
+      threadId,
+      isNewThread,
+    };
+  }, [agent_name, isNewThread, selectorVisible, threadId]);
+
+  const currentKnowledgeScopeSnapshot = useMemo(
+    () =>
+      selectorVisible && agentKnowledgeEnabled && knowledgeScope
+        ? buildKnowledgeScopeSnapshot(knowledgeScope)
+        : null,
+    [agentKnowledgeEnabled, knowledgeScope, selectorVisible],
+  );
 
   useEffect(() => {
     setIsWelcomeMode(isNewThread);
@@ -92,6 +182,7 @@ export default function AgentChatPage() {
     pendingUsageMessages,
     sendMessage,
     regenerateMessage,
+    editAndRegenerateMessage,
     isUploading,
     isHistoryLoading,
     hasMoreHistory,
@@ -99,6 +190,7 @@ export default function AgentChatPage() {
   } = useThreadStream({
     threadId: isNewThread ? undefined : threadId,
     displayThreadId: threadId,
+    assistantId: agent_name,
     context: { ...settings.context, agent_name: agent_name },
     isMock,
     onSend: () => {
@@ -115,6 +207,9 @@ export default function AgentChatPage() {
       setIsNewThread(false);
     },
     onFinish: (state) => {
+      // A run in this thread ended (a send, or a joined scheduled run) while
+      // it is open: it has been read.
+      markThreadRead();
       if (document.hidden || !document.hasFocus()) {
         let body = "Conversation finished";
         const lastMessage = state.messages[state.messages.length - 1];
@@ -162,18 +257,27 @@ export default function AgentChatPage() {
 
   const handleSubmit = useCallback(
     (message: PromptInputMessage, options?: InputBoxSubmitOptions) => {
+      const scopedOptions = currentKnowledgeScopeSnapshot
+        ? {
+            ...options,
+            additionalKwargs: {
+              ...options?.additionalKwargs,
+              [KNOWLEDGE_SCOPE_KEY]: currentKnowledgeScopeSnapshot,
+            },
+          }
+        : options;
       const sendPromise = sendMessage(
         threadId,
         message,
         { agent_name },
-        options,
+        scopedOptions,
       );
       if (message.files.length > 0) {
         return sendPromise;
       }
       void sendPromise;
     },
-    [sendMessage, threadId, agent_name],
+    [currentKnowledgeScopeSnapshot, sendMessage, threadId, agent_name],
   );
 
   const handleSubmitHumanInput = useCallback(
@@ -190,6 +294,9 @@ export default function AgentChatPage() {
           additionalKwargs: {
             hide_from_ui: true,
             human_input_response: response,
+            ...(currentKnowledgeScopeSnapshot
+              ? { [KNOWLEDGE_SCOPE_KEY]: currentKnowledgeScopeSnapshot }
+              : {}),
           },
           onSent: () => {
             sent = true;
@@ -198,7 +305,7 @@ export default function AgentChatPage() {
       );
       return sent;
     },
-    [agent_name, sendMessage, threadId],
+    [agent_name, currentKnowledgeScopeSnapshot, sendMessage, threadId],
   );
 
   const handleStop = useCallback(async () => {
@@ -209,14 +316,33 @@ export default function AgentChatPage() {
       regenerateMessage(threadId, messageId, supersededMessageIds),
     [regenerateMessage, threadId],
   );
+  const handleEditAndRegenerate = useCallback(
+    (messageId: string, replacementText: string) =>
+      editAndRegenerateMessage(
+        threadId,
+        messageId,
+        replacementText,
+        currentKnowledgeScopeSnapshot
+          ? { [KNOWLEDGE_SCOPE_KEY]: currentKnowledgeScopeSnapshot }
+          : undefined,
+      ),
+    [currentKnowledgeScopeSnapshot, editAndRegenerateMessage, threadId],
+  );
 
   const tokenUsageInlineMode = tokenUsageEnabled
     ? localSettings.tokenUsage.inlineMode
     : "off";
   const hasTodos = (thread.values.todos?.length ?? 0) > 0;
-  const { activeGoal, hasGoal, setLocalGoal } = useActiveGoal(
+  const agentBrowserEnabled =
+    agent !== null &&
+    (agent.tool_groups == null || agent.tool_groups.includes("browser"));
+  const browserEnabled =
+    !isNewThread && !isMock && browserControlEnabled && agentBrowserEnabled;
+  const { activeGoal, hasGoal, goalOutcome, setLocalGoal } = useActiveGoal(
     threadId,
     thread.values.goal,
+    thread.values.goal_outcome,
+    thread.messages,
   );
   const hasOpenHumanInputCard = useMemo(
     () =>
@@ -226,6 +352,14 @@ export default function AgentChatPage() {
       ),
     [thread.messages],
   );
+  // A goal blocks edit-and-rerun server-side; show the pencil locked.
+  const editBase =
+    !isNewThread &&
+    !isMock &&
+    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+    !isUploading &&
+    !thread.isLoading &&
+    !hasOpenHumanInputCard;
 
   return (
     <ThreadContext.Provider value={{ thread, isMock }}>
@@ -234,14 +368,14 @@ export default function AgentChatPage() {
         context={{ ...settings.context, agent_name }}
         isMock={isMock}
       >
-        <ChatBox threadId={threadId}>
+        <ChatBox threadId={threadId} browserEnabled={browserEnabled}>
           <div className="relative flex size-full min-h-0 justify-between">
             <header
               className={cn(
-                "absolute top-0 right-0 left-0 z-30 flex h-12 shrink-0 items-center gap-2 px-2 sm:px-4",
+                "absolute top-0 right-0 left-0 flex h-12 shrink-0 items-center gap-2 px-2 sm:px-4",
                 isWelcomeMode
-                  ? "bg-background/0 backdrop-blur-none"
-                  : "bg-background/80 shadow-xs backdrop-blur",
+                  ? "bg-background/0 z-40 backdrop-blur-none"
+                  : "bg-background/80 z-30 shadow-xs backdrop-blur",
               )}
             >
               <SidebarTrigger className="md:hidden" />
@@ -249,14 +383,38 @@ export default function AgentChatPage() {
               <div className="flex min-w-0 shrink-0 items-center gap-1.5 rounded-md border px-2 py-1">
                 <BotIcon className="text-primary h-3.5 w-3.5" />
                 <span className="hidden max-w-24 truncate text-xs font-medium sm:inline sm:max-w-none">
-                  {agent?.name ?? agent_name}
+                  {agent?.display_name?.length
+                    ? agent.display_name
+                    : (agent?.name ?? agent_name)}
                 </span>
               </div>
 
               <div className="flex min-w-0 flex-1 items-center text-sm font-medium">
-                <ThreadTitle threadId={threadId} thread={thread} />
+                <ThreadTitle
+                  threadId={threadId}
+                  thread={thread}
+                  canonicalTitle={threadMetadata.data?.values?.title}
+                />
+                {!isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                    <ThreadArchiveStatus
+                      threadId={threadId}
+                      metadata={threadMetadata.data?.metadata}
+                    />
+                  )}
               </div>
               <div className="flex shrink-0 items-center sm:mr-4">
+                {!isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                    <ThreadBackgroundTasks threadId={threadId} />
+                  )}
+                {!isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                    <ThreadSubagentBatches threadId={threadId} />
+                  )}
                 <Tooltip content={t.agents.newChat}>
                   <Button
                     className="px-2 sm:px-3"
@@ -270,19 +428,26 @@ export default function AgentChatPage() {
                     <span className="hidden sm:inline">{t.agents.newChat}</span>
                   </Button>
                 </Tooltip>
-                <TokenUsageIndicator
-                  threadId={isNewThread ? undefined : threadId}
-                  backendUsage={backendTokenUsage}
-                  enabled={tokenUsageEnabled}
-                  messages={thread.messages}
-                  pendingMessages={pendingUsageMessages}
-                  preferences={localSettings.tokenUsage}
-                  onPreferencesChange={(preferences) =>
-                    setLocalSettings("tokenUsage", preferences)
-                  }
-                />
+                {tokenUsageEnabled ? (
+                  <TokenUsageIndicator
+                    threadId={isNewThread ? undefined : threadId}
+                    backendUsage={backendTokenUsage}
+                    contextUsage={contextUsage}
+                    enabled={tokenUsageEnabled}
+                    messages={thread.messages}
+                    pendingMessages={pendingUsageMessages}
+                    preferences={localSettings.tokenUsage}
+                    onPreferencesChange={(preferences) =>
+                      setLocalSettings("tokenUsage", preferences)
+                    }
+                  />
+                ) : (
+                  <ContextUsageBadge contextUsage={contextUsage} />
+                )}
                 <SidecarTrigger />
+                {browserEnabled && <BrowserTrigger />}
                 <ExportTrigger threadId={threadId} />
+                <ThreadExtensionActions threadId={threadId} />
                 <ArtifactTrigger />
               </div>
             </header>
@@ -290,10 +455,15 @@ export default function AgentChatPage() {
             <main className="flex min-h-0 max-w-full grow flex-col">
               <div className="flex min-h-0 flex-1 justify-center">
                 <MessageList
+                  archiveDownloadsEnabled={
+                    isNewThread || isMock || threadMetadata.data != null
+                  }
                   className={cn("size-full", !isWelcomeMode && "pt-10")}
                   testId="main-message-list"
                   threadId={threadId}
                   thread={thread}
+                  scheduledTaskEvents={scheduledTaskEvents.data}
+                  enableConversationOutline
                   paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
                   hasMoreHistory={hasMoreHistory}
                   loadMoreHistory={loadMoreHistory}
@@ -307,6 +477,9 @@ export default function AgentChatPage() {
                     !thread.isLoading
                   }
                   onRegenerateMessage={handleRegenerate}
+                  canEdit={editBase && !hasGoal}
+                  editLockedByGoal={editBase && hasGoal}
+                  onEditAndRegenerateMessage={handleEditAndRegenerate}
                   onSubmitHumanInput={
                     isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
                       ? undefined
@@ -331,7 +504,7 @@ export default function AgentChatPage() {
                       : "max-w-(--container-width-md)",
                   )}
                 >
-                  {(hasGoal || hasTodos) && (
+                  {(hasGoal || goalOutcome !== null || hasTodos) && (
                     <div
                       className={cn(
                         "right-0 left-0 z-0",
@@ -344,7 +517,12 @@ export default function AgentChatPage() {
                           isWelcomeMode ? "absolute" : "relative",
                         )}
                       >
-                        {activeGoal && <GoalStatus goal={activeGoal} />}
+                        <GoalStatus
+                          goal={activeGoal}
+                          outcome={goalOutcome}
+                          isRunning={thread.isLoading}
+                          hasOpenHumanInputCard={hasOpenHumanInputCard}
+                        />
                         {hasTodos && (
                           <TodoList
                             className="bg-background/5"
@@ -363,9 +541,31 @@ export default function AgentChatPage() {
                     )}
                     isWelcomeMode={isWelcomeMode}
                     threadId={threadId}
+                    projectId={
+                      !isNewThread && threadMetadata.data
+                        ? projectIdOfThread(threadMetadata.data)
+                        : null
+                    }
                     draftThreadId={isNewThread ? "new" : threadId}
                     draftAgentName={agent_name}
+                    agentSkillNames={agent?.skills}
+                    agentSkillsLoading={agentSkillsLoading}
                     defaultModelName={agent?.model}
+                    knowledgeScopeControl={
+                      selectorVisible && knowledgeScope ? (
+                        <KnowledgeScopeSelector
+                          agentName={agent_name}
+                          disabled={thread.isLoading || isUploading}
+                          selection={knowledgeScope}
+                          unavailableReason={
+                            agentKnowledgeEnabled
+                              ? undefined
+                              : t.knowledge.scope.agentUnavailable
+                          }
+                          onChange={setKnowledgeScope}
+                        />
+                      ) : undefined
+                    }
                     autoFocus={isWelcomeMode}
                     status={
                       thread.error
@@ -385,15 +585,19 @@ export default function AgentChatPage() {
                     disabled={
                       env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" ||
                       isUploading ||
-                      hasOpenHumanInputCard ||
+                      (selectorVisible && agent === null) ||
                       (!isNewThread && isHistoryLoading)
                     }
-                    onContextChange={(context) =>
-                      setSettings("context", context)
-                    }
+                    onContextChange={(context, options) => {
+                      if (options?.automatic)
+                        resolveThreadContext(threadId, context);
+                      else setSettings("context", context);
+                    }}
                     onGoalChange={setLocalGoal}
                     onSubmit={handleSubmit}
                     onStop={handleStop}
+                    canStopStreaming={canStopStreaming}
+                    canCreateRuns={canCreateRuns}
                   />
                   {env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" && (
                     <div className="text-muted-foreground/67 w-full translate-y-12 text-center text-xs">

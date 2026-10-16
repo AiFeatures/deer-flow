@@ -121,10 +121,10 @@ def _install_manager(monkeypatch, manager):
 class TestGetMemoryTools:
     """Tests for get_memory_tools registry."""
 
-    def test_returns_four_tools(self):
-        """Should return exactly 4 tools."""
+    def test_returns_five_tools(self):
+        """Should return exactly 5 tools."""
         tools = get_memory_tools()
-        assert len(tools) == 4
+        assert len(tools) == 5
 
     def test_tools_have_unique_names(self):
         """All tools should have unique names."""
@@ -132,6 +132,7 @@ class TestGetMemoryTools:
         names = [t.name for t in tools]
         assert len(names) == len(set(names))
         assert "memory_search" in names
+        assert "memory_get" in names
         assert "memory_add" in names
         assert "memory_update" in names
         assert "memory_delete" in names
@@ -234,7 +235,7 @@ class TestMemoryAddTool:
 
         result_json = memory_add_tool.func(SimpleNamespace(context={}), "low confidence fact", confidence=0.1)
         result = json.loads(result_json)
-        assert result == {"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"}
+        assert result == {"error": "Fact was not stored because the configured memory.max_facts capacity policy evicted it"}
         assert recorded == ["low confidence fact"]
 
     def test_uses_runtime_scope(self, monkeypatch):
@@ -392,6 +393,7 @@ class TestModeGating:
 
         tool_names = [t.name for t in extra_tools]
         assert "memory_search" in tool_names
+        assert "memory_get" in tool_names
         assert "memory_add" in tool_names
         assert "memory_update" in tool_names
         assert "memory_delete" in tool_names
@@ -415,6 +417,20 @@ class TestModeGating:
         tool_names = [t.name for t in extra_tools]
         assert MemoryMiddleware not in middleware_types
         assert "memory_add" in tool_names
+
+    def test_mem0_tool_mode_keeps_passive_write_middleware(self):
+        """mem0 has search tools but no fact CRUD, so tool mode must retain
+        the per-turn middleware write path that feeds server-side extraction."""
+        from deerflow.agents.factory import _assemble_from_features
+        from deerflow.agents.features import RuntimeFeatures
+        from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+        from deerflow.config.memory_config import MemoryConfig
+
+        config = MemoryConfig(enabled=True, mode="tool", manager_class="mem0")
+        chain, extra_tools = _assemble_from_features(RuntimeFeatures(memory=True, memory_config=config), name="test-agent")
+
+        assert MemoryMiddleware in [type(m) for m in chain]
+        assert "memory_search" in [tool.name for tool in extra_tools]
 
     def test_middleware_mode_appends_middleware_not_tools(self, monkeypatch):
         """When mode=middleware (default), MemoryMiddleware IS in the chain
@@ -506,7 +522,7 @@ class TestModeGating:
         monkeypatch.setattr(
             lead_agent_module,
             "load_agent_config",
-            lambda name: SimpleNamespace(model=None, skills=None, tool_groups=None),
+            lambda name, *, user_id=None: SimpleNamespace(model=None, skills=None, tool_groups=None),
         )
         monkeypatch.setattr(lead_agent_module, "_load_enabled_available_skills", lambda available_skills, *, app_config, user_id=None: [])
         monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [_NamedTool("memory_search"), _NamedTool("bash")])
@@ -541,7 +557,7 @@ class TestModeGating:
         monkeypatch.setattr(
             lead_agent_module,
             "load_agent_config",
-            lambda name: SimpleNamespace(model=None, skills=None, tool_groups=None),
+            lambda name, *, user_id=None: SimpleNamespace(model=None, skills=None, tool_groups=None),
         )
         monkeypatch.setattr(lead_agent_module, "_load_enabled_available_skills", lambda available_skills, *, app_config, user_id=None: [])
         monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [_NamedTool("bash"), _NamedTool("bash")])

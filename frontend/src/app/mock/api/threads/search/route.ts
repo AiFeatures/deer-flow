@@ -1,5 +1,4 @@
-import fs from "fs";
-import path from "path";
+import { DEMO_THREAD_IDS } from "@/core/threads/static-demo";
 
 type ThreadSearchRequest = {
   limit?: number;
@@ -37,26 +36,48 @@ export async function POST(request: Request) {
   const sortBy = body.sortBy ?? "updated_at";
   const sortOrder = body.sortOrder ?? "desc";
 
-  const threadsDir = fs.readdirSync(
-    path.resolve(process.cwd(), "public/demo/threads"),
-    {
-      withFileTypes: true,
-    },
-  );
-  const threadData = threadsDir
-    .map((threadId) => {
-      if (threadId.isDirectory() && !threadId.name.startsWith(".")) {
-        const threadData = fs.readFileSync(
-          path.resolve(`public/demo/threads/${threadId.name}/thread.json`),
-          "utf8",
-        );
-        return {
-          thread_id: threadId.name,
-          values: JSON.parse(threadData).values,
-        };
-      }
-      return false;
-    })
-    .filter(Boolean);
-  return Response.json(threadData);
+  const origin = new URL(request.url).origin;
+  const threadData = (
+    await Promise.all(
+      DEMO_THREAD_IDS.map(
+        async (threadId): Promise<MockThreadSearchResult | null> => {
+          const response = await fetch(
+            new URL(
+              `/demo/threads/${encodeURIComponent(threadId)}/thread.json`,
+              origin,
+            ),
+            { signal: request.signal },
+          );
+          if (!response.ok) return null;
+          const data = (await response.json()) as Record<string, unknown>;
+          const thread: MockThreadSearchResult = {
+            ...data,
+            thread_id: threadId,
+            updated_at:
+              typeof data.updated_at === "string"
+                ? data.updated_at
+                : typeof data.created_at === "string"
+                  ? data.created_at
+                  : undefined,
+          };
+          return thread;
+        },
+      ),
+    )
+  )
+    .filter((thread): thread is MockThreadSearchResult => thread !== null)
+    .sort((a, b) => {
+      const aTimestamp = a[sortBy];
+      const bTimestamp = b[sortBy];
+      const aParsed =
+        typeof aTimestamp === "string" ? Date.parse(aTimestamp) : 0;
+      const bParsed =
+        typeof bTimestamp === "string" ? Date.parse(bTimestamp) : 0;
+      const aValue = Number.isNaN(aParsed) ? 0 : aParsed;
+      const bValue = Number.isNaN(bParsed) ? 0 : bParsed;
+      return sortOrder === "asc" ? aValue - bValue : bValue - aValue;
+    });
+
+  const pagedThreads = threadData.slice(offset, offset + limit);
+  return Response.json(pagedThreads);
 }

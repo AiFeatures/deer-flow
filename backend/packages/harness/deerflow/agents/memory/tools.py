@@ -1,12 +1,12 @@
 """Memory tools for tool-driven memory mode.
 
-Exposes memory_search, memory_add, memory_update, memory_delete as
+Exposes memory_search, memory_get, memory_add, memory_update, memory_delete as
 LangChain @tool functions the model can call directly.
 
-When memory.mode == "tool", these tools are registered on the agent
-instead of appending MemoryMiddleware.  The model gains agency over
-its own persistent memory: it decides what to remember, when to
-search, and when to update or remove stale facts.
+When memory.mode == "tool", these tools are registered on the agent. Most
+backends omit MemoryMiddleware so the model drives persistence; a backend that
+sets ``requires_passive_writes_in_tool_mode`` retains conversation writes while
+the tools provide query-aware recall.
 
 Backend-agnostic: every tool goes through the ``MemoryManager`` ABC
 (:func:`get_memory_manager`) -- ``search``/``get_memory`` are tier-2 methods;
@@ -84,6 +84,38 @@ def memory_search_tool(
         return json.dumps({"error": str(exc)})
 
 
+@tool("memory_get", parse_docstring=True)
+def memory_get_tool(runtime: Runtime, fact_id: str) -> str:
+    """Read one stored fact by its exact ID in the current user and agent scope.
+
+    Use this to revisit a fact whose ID you already know from memory_search
+    or memory_add. Use memory_search when you do not know the ID.
+
+    Args:
+        fact_id: Exact fact ID returned by memory_search or memory_add.
+
+    Returns:
+        JSON string with "fact" containing the stored fact object.
+        Missing facts and unsupported backends return "error".
+    """
+    agent_name, user_id = _resolve_scope(runtime)
+    try:
+        manager = get_memory_manager()
+        if agent_name is not None and getattr(manager, "supports_agent_scoped_management", False) is not True:
+            return json.dumps({"error": f"memory backend {type(manager).__name__} does not support agent-scoped memory reads"})
+        try:
+            memory = manager.get_memory(user_id=user_id, agent_name=agent_name)
+        except NotImplementedError:
+            return json.dumps({"error": f"memory backend {type(manager).__name__} does not support get_memory"})
+        for fact in memory.get("facts", []):
+            if fact.get("id") == fact_id:
+                return json.dumps({"fact": fact}, ensure_ascii=False)
+        return json.dumps({"error": f"Fact not found: {fact_id}"})
+    except Exception as exc:
+        logger.exception("memory_get_tool failed")
+        return json.dumps({"error": str(exc)})
+
+
 @tool("memory_add", parse_docstring=True)
 def memory_add_tool(
     runtime: Runtime,
@@ -118,9 +150,11 @@ def memory_add_tool(
         content_key = _memory_content_key(normalized_content)
         manager = get_memory_manager()
         existing_facts = manager.get_memory(agent_name=agent_name, user_id=user_id).get("facts", [])
-        # Tool calls normally run one-at-a-time per user turn. If tool-mode
-        # writing broadens to multiple concurrent calls for the same user,
-        # move duplicate rejection into the storage/update critical section.
+        # Fast-path duplicate rejection to spare a write attempt in the common
+        # case. The authoritative check lives in the backend's create critical
+        # section (DeerMem re-checks against a fresh snapshot on every
+        # revision-conflict retry in create_memory_fact), so concurrent tool
+        # calls for the same user cannot both store the same content.
         if any(_memory_content_key(str(fact.get("content", ""))) == content_key for fact in existing_facts):
             return json.dumps({"error": "Duplicate fact"})
 
@@ -139,9 +173,9 @@ def memory_add_tool(
         except NotImplementedError:
             return json.dumps({"error": f"memory backend {type(manager).__name__} does not support create_fact"})
         if fact_id is None:
-            # max_facts cap kept higher-confidence facts and evicted the new one;
-            # the fact was not stored -- report honestly instead of a dangling id.
-            return json.dumps({"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"})
+            # The configured max_facts policy evicted the new fact; report the
+            # capacity result instead of a dangling id.
+            return json.dumps({"error": "Fact was not stored because the configured memory.max_facts capacity policy evicted it"})
         return json.dumps({"fact_id": fact_id, "status": "added"})
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
@@ -242,6 +276,7 @@ def get_memory_tools() -> list:
     """
     return [
         memory_search_tool,
+        memory_get_tool,
         memory_add_tool,
         memory_update_tool,
         memory_delete_tool,

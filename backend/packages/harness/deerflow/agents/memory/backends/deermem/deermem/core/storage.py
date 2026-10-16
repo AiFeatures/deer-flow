@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -31,12 +32,23 @@ from typing import Any, Protocol
 import yaml
 
 from ..config import DeerMemConfig
-from .paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, fact_file_path, memory_file_path, safe_user_id, validate_agent_name
+from .eviction import FactEvictionDecision
+from .paths import (
+    DEFAULT_AGENT_BUCKET,
+    agent_eviction_audit_path,
+    agent_facts_directory,
+    agent_metadata_directory,
+    agent_usage_path,
+    fact_file_path,
+    memory_file_path,
+    safe_user_id,
+    validate_agent_name,
+)
 
 logger = logging.getLogger(__name__)
 
 DOCUMENT_VERSION = "2.0"
-CORE_CATEGORIES = frozenset({"preference", "correction", "context", "goal", "behavior", "identity", "constraint", "decision", "other"})
+CORE_CATEGORIES = frozenset({"preference", "correction", "context", "goal", "behavior", "cognitive", "identity", "constraint", "decision", "other"})
 
 
 class MemoryStorageError(RuntimeError):
@@ -68,6 +80,10 @@ class RetrievalPort(Protocol):
 
     def search(self, query: str, *, scopes: list[dict[str, str | None]], top_k: int, mode: str, filters: dict[str, Any] | None) -> list[dict[str, Any]]: ...
 
+    def clear(self, *, scopes: list[dict[str, str | None]] | None = None) -> None: ...
+
+    def rebuild(self, records: list[tuple[dict[str, Any], dict[str, str | None], str]], *, scopes: list[dict[str, str | None]] | None) -> None: ...
+
 
 RetrievalNotification = tuple[str, dict[str, Any] | str, str | None]
 ScopedRetrievalNotifications = tuple[str, list[RetrievalNotification]]
@@ -87,6 +103,7 @@ def create_empty_memory() -> dict[str, Any]:
             "workContext": {"summary": "", "updatedAt": ""},
             "personalContext": {"summary": "", "updatedAt": ""},
             "topOfMind": {"summary": "", "updatedAt": ""},
+            "cognitiveStyle": {"summary": "", "updatedAt": ""},
         },
         "history": {
             "recentMonths": {"summary": "", "updatedAt": ""},
@@ -95,6 +112,84 @@ def create_empty_memory() -> dict[str, Any]:
         },
         "facts": [],
     }
+
+
+def _normalize_context_section(value: Any) -> dict[str, Any]:
+    """Return a canonical summary section while preserving extension fields."""
+    if not isinstance(value, dict):
+        return {"summary": "", "updatedAt": ""}
+    section = copy.deepcopy(value)
+    section["summary"] = value.get("summary") if isinstance(value.get("summary"), str) else ""
+    section["updatedAt"] = value.get("updatedAt") if isinstance(value.get("updatedAt"), str) else ""
+    return section
+
+
+def _normalize_legacy_import_fact(value: Any) -> dict[str, Any] | None:
+    """Canonicalize recoverable public/legacy fact fields before repository writes."""
+    if not isinstance(value, dict):
+        return None
+    content = value.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    fact = copy.deepcopy(value)
+    fact["content"] = content.strip()
+    fact_id = fact.get("id")
+    fact["id"] = fact_id.strip() if isinstance(fact_id, str) and fact_id.strip() else f"fact_{uuid.uuid4().hex[:8]}"
+    category = fact.get("category")
+    fact["category"] = category.strip() if isinstance(category, str) and category.strip() else "context"
+
+    confidence = fact.get("confidence", 0.5)
+    if isinstance(confidence, bool):
+        numeric_confidence = 0.5
+    else:
+        try:
+            numeric_confidence = float(confidence)
+        except (TypeError, ValueError):
+            numeric_confidence = 0.5
+    fact["confidence"] = min(1.0, max(0.0, numeric_confidence)) if math.isfinite(numeric_confidence) else 0.5
+
+    created_at = fact.get("createdAt")
+    fact["createdAt"] = created_at.strip() if isinstance(created_at, str) else ""
+    source = fact.get("source")
+    fact["source"] = source.strip() if isinstance(source, str) and source.strip() else "unknown"
+    if "sourceError" in fact and fact["sourceError"] is not None and not isinstance(fact["sourceError"], str):
+        fact.pop("sourceError")
+    return fact
+
+
+def _normalize_memory_summaries(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize additive summary fields without relaxing fact validation."""
+    empty = create_empty_memory()
+    summaries: dict[str, Any] = {}
+    for section_name, section_keys in (
+        ("user", ("workContext", "personalContext", "topOfMind", "cognitiveStyle")),
+        ("history", ("recentMonths", "earlierContext", "longTermBackground")),
+    ):
+        incoming = data.get(section_name)
+        incoming = incoming if isinstance(incoming, dict) else {}
+        complete = copy.deepcopy(empty[section_name])
+        for key, value in incoming.items():
+            complete[key] = _normalize_context_section(value) if key in section_keys else copy.deepcopy(value)
+        for key in section_keys:
+            complete[key] = _normalize_context_section(complete.get(key))
+        summaries[section_name] = complete
+
+    return summaries
+
+
+def normalize_memory_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical compatibility document without mutating the caller."""
+    normalized = copy.deepcopy(data) if isinstance(data, dict) else {}
+    normalized.update(_normalize_memory_summaries(normalized))
+
+    facts = normalized.get("facts")
+    normalized["facts"] = [fact for value in facts if (fact := _normalize_legacy_import_fact(value)) is not None] if isinstance(facts, list) else []
+    if not isinstance(normalized.get("version"), str):
+        normalized["version"] = "1.0"
+    if not isinstance(normalized.get("lastUpdated"), str):
+        normalized["lastUpdated"] = ""
+    return normalized
 
 
 def _has_meaningful_data(value: Any) -> bool:
@@ -153,10 +248,31 @@ def _normalize_category(fact: dict[str, Any]) -> None:
     raw_category = fact.get("category", "context")
     if not isinstance(raw_category, str):
         raise ValueError("fact.category must be a string")
-    category = raw_category or "context"
-    if category not in CORE_CATEGORIES:
-        fact.setdefault("categoryExtension", category)
-        fact["category"] = "other"
+    fact["category"] = raw_category or "context"
+    # ``categoryExtension`` is only meaningful while ``category`` is "other"
+    # (pre-native-category builds parked non-core labels there).  Once a label
+    # is stored natively -- including a legacy "other"+extension fact updated
+    # to a real category -- the leftover field would contradict the Gateway's
+    # documented meaning, so drop it.
+    if fact["category"] != "other":
+        fact.pop("categoryExtension", None)
+
+
+def _category_comparison_key(fact: dict[str, Any]) -> tuple[Any, ...]:
+    """Category pair with the legacy ``other`` alias folded into the label.
+
+    Pre-native-category builds persisted a label outside CORE_CATEGORIES as
+    ``category="other"`` plus ``categoryExtension=<label>``; this build stores
+    the label natively.  A migration interrupted after its Markdown commit but
+    before the legacy JSON delete must still recognize its own result on retry,
+    so ``"other"``/<label> compares equal to <label>/no-extension here, while
+    genuinely different labels or extensions stay different.
+    """
+    category = fact.get("category")
+    extension = fact.get("categoryExtension")
+    if category == "other" and isinstance(extension, str) and extension:
+        return extension, None
+    return category, extension
 
 
 def _require_string_list(fact: dict[str, Any], field: str) -> None:
@@ -203,6 +319,12 @@ def _normalize_fact(
     normalized["scope"] = copy.deepcopy(scope)
     _require_string_list(normalized, "topics")
     _require_string_list(normalized, "consolidatedFrom")
+    last_confirmed_at = normalized.get("lastConfirmedAt")
+    if last_confirmed_at is not None and not isinstance(last_confirmed_at, str):
+        raise ValueError("fact.lastConfirmedAt must be a string when present")
+    confirmation_count = normalized.get("confirmationCount")
+    if confirmation_count is not None and (isinstance(confirmation_count, bool) or not isinstance(confirmation_count, int) or confirmation_count < 1):
+        raise ValueError("fact.confirmationCount must be an integer >= 1 when present")
     revision = normalized.get("revision", 1)
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise ValueError("fact.revision must be an integer >= 1")
@@ -309,6 +431,26 @@ def _parse_fact_markdown(path: Path) -> dict[str, Any]:
         raise MemoryStorageCorruption(f"Failed to parse canonical fact {path}: {exc}") from exc
 
 
+def _parse_listed_fact(path: Path) -> dict[str, Any] | None:
+    """Parse a fact found by a directory scan that ran without the scope locks.
+
+    A commit can delete a listed fact before it is opened; that vanished entry
+    returns ``None``. An entry that is still present but unreadable (such as a
+    dangling symlink) remains corruption.
+
+    The ``lexists`` re-check is a best-effort heuristic, not an exact test: a
+    delete followed by a recreate of the same id before the check still raises
+    (the conservative side), and an ``lstat`` failure on a parent directory
+    (such as ``EACCES``) reads as vanished, so that entry is skipped.
+    """
+    try:
+        return _parse_fact_markdown(path)
+    except MemoryStorageCorruption:
+        if os.path.lexists(path):
+            raise
+        return None
+
+
 def _fsync_parent_directory(directory: Path) -> None:
     """Make a completed rename durable on POSIX filesystems."""
     if os.name == "nt":
@@ -341,12 +483,17 @@ def _atomic_write(path: Path, raw: bytes) -> None:
 def _process_file_lock(lock_path: Path, timeout_seconds: float) -> Iterator[None]:
     """Cross-process advisory lock for one scope, using only the stdlib."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+b")
     deadline = time.monotonic() + timeout_seconds
     acquired = False
+    handle: Any = None
     try:
         while not acquired:
             try:
+                # (Re)open inside the retry loop: on Windows two threads/processes
+                # racing to create a not-yet-existing lock file with an append
+                # open transiently raise PermissionError (EACCES) on ``open()``
+                # itself, before the byte-range lock below is ever attempted.
+                handle = open(lock_path, "a+b")
                 if os.name == "nt":
                     import msvcrt
 
@@ -362,6 +509,9 @@ def _process_file_lock(lock_path: Path, timeout_seconds: float) -> Iterator[None
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
             except OSError:
+                if handle is not None:
+                    handle.close()
+                    handle = None
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"Timed out acquiring memory scope lock {lock_path}")
                 time.sleep(0.05)
@@ -380,7 +530,8 @@ def _process_file_lock(lock_path: Path, timeout_seconds: float) -> Iterator[None
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
                 logger.warning("Failed to release memory scope lock %s", lock_path)
-        handle.close()
+        if handle is not None:
+            handle.close()
 
 
 class MemoryStorage(abc.ABC):
@@ -408,6 +559,49 @@ class MemoryStorage(abc.ABC):
         """Clear global summaries and every agent fact bucket for one user."""
         raise NotImplementedError
 
+    def get_fact_usage(
+        self,
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return optional query-usage sidecar data for capacity scoring."""
+        return {}
+
+    def record_fact_accesses(
+        self,
+        fact_ids: list[str],
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+        accessed_at: datetime | None = None,
+    ) -> None:
+        """Record actual query hits; alternative providers may override."""
+
+    def record_capacity_eviction(
+        self,
+        decision: FactEvictionDecision,
+        *,
+        max_facts: int,
+        agent_name: str,
+        user_id: str | None = None,
+        occurred_at: datetime | None = None,
+        shadow_decision: FactEvictionDecision | None = None,
+    ) -> None:
+        """Persist optional metadata-only eviction evidence."""
+
+    def clear_fact_metadata(
+        self,
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+        fact_ids: list[str] | None = None,
+    ) -> None:
+        """Remove sidecar data for selected facts, or the whole scope."""
+
+    def close(self) -> None:
+        """Release optional storage resources."""
+
 
 class FileMemoryStorage(MemoryStorage):
     def __init__(self, config: DeerMemConfig, retrieval: RetrievalPort | None = None):
@@ -416,6 +610,256 @@ class FileMemoryStorage(MemoryStorage):
         self._memory_cache: dict[tuple[str | None, str | None], tuple[dict[str, Any], tuple[Any, ...]]] = {}
         self._cache_lock = threading.Lock()
         self._scope_locks: weakref.WeakValueDictionary[tuple[str | None, str | None], threading.RLock] = weakref.WeakValueDictionary()
+        self._retrieval_dirty_scopes: set[tuple[str | None, str | None]] = set()
+        # Manifest signature at which this process last brought each agent scope's
+        # index in sync. A different live signature means another process wrote
+        # the user's memory, so the scope is rebuilt before it is searched.
+        self._retrieval_synced_signatures: dict[tuple[str | None, str | None], tuple[Any, ...]] = {}
+        # Generations bumped (under _cache_lock) whenever rebuild_index publishes
+        # or forgets a scope's rows: per scope for a scoped rebuild, storage-wide
+        # for a full one. Signature promotion after an own commit is fenced on
+        # them, because a rebuild that installed rows in between may have read
+        # its facts before that commit and has recorded its own signature.
+        self._retrieval_index_generation = 0
+        self._retrieval_scope_generations: dict[tuple[str | None, str | None], int] = {}
+        # Serializes a rebuild's row replacement with its signature publication
+        # (see rebuild_index): the adapter lock ends when the install returns, so
+        # two overlapping refreshes of one scope could otherwise install in one
+        # order and publish in the other.
+        self._retrieval_publish_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Release the retrieval adapter owned by this storage instance."""
+        if self._retrieval is not None:
+            self._retrieval.close()
+
+    @staticmethod
+    def _read_json_sidecar(path: Path, *, expected_type: type[dict] | type[list]) -> dict[str, Any] | list[Any]:
+        if not path.exists():
+            return expected_type()
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Ignoring malformed DeerMem sidecar %s", path, exc_info=True)
+            return expected_type()
+        if not isinstance(value, expected_type):
+            logger.warning("Ignoring DeerMem sidecar with invalid root type: %s", path)
+            return expected_type()
+        return value
+
+    def get_fact_usage(
+        self,
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        key = self._cache_key(agent_name, user_id=user_id)
+        with (
+            self._scope_lock(key),
+            _process_file_lock(
+                path.parent / ".memory.lock",
+                float(getattr(self._config, "file_lock_timeout_seconds", 10)),
+            ),
+        ):
+            raw = self._read_json_sidecar(
+                agent_usage_path(path, agent_name),
+                expected_type=dict,
+            )
+        return {str(fact_id): copy.deepcopy(entry) for fact_id, entry in raw.items() if isinstance(fact_id, str) and isinstance(entry, dict)}
+
+    def record_fact_accesses(
+        self,
+        fact_ids: list[str],
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+        accessed_at: datetime | None = None,
+    ) -> None:
+        unique_ids = list(dict.fromkeys(fact_id for fact_id in fact_ids if fact_id))
+        if not unique_ids:
+            return
+        now = (accessed_at or datetime.now(UTC)).astimezone(UTC)
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        sidecar_path = agent_usage_path(path, agent_name)
+        key = self._cache_key(agent_name, user_id=user_id)
+        with (
+            self._scope_lock(key),
+            _process_file_lock(
+                path.parent / ".memory.lock",
+                float(getattr(self._config, "file_lock_timeout_seconds", 10)),
+            ),
+        ):
+            # Coordinate with deletion under the same lock. If a search raced
+            # with an explicit delete, never recreate usage metadata for a fact
+            # whose canonical file is already gone.
+            existing_ids = [fact_id for fact_id in unique_ids if fact_file_path(path, fact_id, agent_name=agent_name).exists()]
+            if not existing_ids:
+                return
+            raw = self._read_json_sidecar(sidecar_path, expected_type=dict)
+            usage = raw if isinstance(raw, dict) else {}
+            for fact_id in existing_ids:
+                previous = usage.get(fact_id)
+                previous = previous if isinstance(previous, dict) else {}
+                previous_heat = previous.get("accessHeat", 0.0)
+                try:
+                    heat = float(previous_heat)
+                except (TypeError, ValueError):
+                    heat = 0.0
+                if not math.isfinite(heat) or heat < 0:
+                    heat = 0.0
+                last_accessed = previous.get("lastAccessedAt")
+                try:
+                    parsed = datetime.fromisoformat(str(last_accessed).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    elapsed_days = max(0.0, (now - parsed.astimezone(UTC)).total_seconds() / 86400)
+                    heat *= 2 ** (-elapsed_days / self._config.eviction_access_half_life_days)
+                except (TypeError, ValueError):
+                    heat = 0.0
+                raw_count = previous.get("accessCount", 0)
+                count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0 else 0
+                usage[fact_id] = {
+                    "accessHeat": heat + 1.0,
+                    "accessCount": count + 1,
+                    "lastAccessedAt": now.isoformat().removesuffix("+00:00") + "Z",
+                }
+            _atomic_write(
+                sidecar_path,
+                json.dumps(usage, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+
+    def record_capacity_eviction(
+        self,
+        decision: FactEvictionDecision,
+        *,
+        max_facts: int,
+        agent_name: str,
+        user_id: str | None = None,
+        occurred_at: datetime | None = None,
+        shadow_decision: FactEvictionDecision | None = None,
+    ) -> None:
+        if not decision.evicted or self._config.eviction_audit_max_entries == 0:
+            return
+        now = (occurred_at or datetime.now(UTC)).astimezone(UTC)
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        sidecar_path = agent_eviction_audit_path(path, agent_name)
+        event: dict[str, Any] = {
+            "occurredAt": now.isoformat().removesuffix("+00:00") + "Z",
+            "reason": "capacity",
+            "policyVersion": decision.policy,
+            "maxFacts": max_facts,
+            "reservedCorrectionSlots": decision.reserved_correction_slots,
+            "evicted": [
+                {
+                    "factId": item.fact_id,
+                    "category": item.category,
+                    "score": item.score,
+                    "components": copy.deepcopy(item.components),
+                }
+                for item in decision.evicted
+            ],
+        }
+        if shadow_decision is not None:
+            actual_ids = {item.fact_id for item in decision.evicted}
+            shadow_ids = {item.fact_id for item in shadow_decision.evicted}
+            event["shadow"] = {
+                "policyVersion": shadow_decision.policy,
+                "wouldEvict": sorted(shadow_ids),
+                "disagrees": actual_ids != shadow_ids,
+            }
+        key = self._cache_key(agent_name, user_id=user_id)
+        with (
+            self._scope_lock(key),
+            _process_file_lock(
+                path.parent / ".memory.lock",
+                float(getattr(self._config, "file_lock_timeout_seconds", 10)),
+            ),
+        ):
+            raw = self._read_json_sidecar(sidecar_path, expected_type=list)
+            events = raw if isinstance(raw, list) else []
+            events.append(event)
+            events = events[-self._config.eviction_audit_max_entries :]
+            _atomic_write(
+                sidecar_path,
+                json.dumps(events, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+
+    def clear_fact_metadata(
+        self,
+        *,
+        agent_name: str,
+        user_id: str | None = None,
+        fact_ids: list[str] | None = None,
+    ) -> None:
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        metadata_path = agent_metadata_directory(path, agent_name)
+        key = self._cache_key(agent_name, user_id=user_id)
+        with (
+            self._scope_lock(key),
+            _process_file_lock(
+                path.parent / ".memory.lock",
+                float(getattr(self._config, "file_lock_timeout_seconds", 10)),
+            ),
+        ):
+            if fact_ids is None:
+                if metadata_path.exists():
+                    shutil.rmtree(metadata_path)
+                return
+            removed_ids = set(fact_ids)
+            if not removed_ids:
+                return
+            usage_path = agent_usage_path(path, agent_name)
+            raw_usage = self._read_json_sidecar(usage_path, expected_type=dict)
+            usage = raw_usage if isinstance(raw_usage, dict) else {}
+            filtered_usage = {fact_id: value for fact_id, value in usage.items() if fact_id not in removed_ids}
+            if filtered_usage:
+                _atomic_write(
+                    usage_path,
+                    json.dumps(filtered_usage, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+            else:
+                usage_path.unlink(missing_ok=True)
+
+            audit_path = agent_eviction_audit_path(path, agent_name)
+            raw_events = self._read_json_sidecar(audit_path, expected_type=list)
+            events = raw_events if isinstance(raw_events, list) else []
+            filtered_events: list[dict[str, Any]] = []
+            for raw_event in events:
+                if not isinstance(raw_event, dict):
+                    continue
+                event = copy.deepcopy(raw_event)
+                evicted = event.get("evicted")
+                if not isinstance(evicted, list):
+                    continue
+                event["evicted"] = [item for item in evicted if isinstance(item, dict) and isinstance(item.get("factId"), str) and item["factId"] not in removed_ids]
+                shadow = event.get("shadow")
+                if isinstance(shadow, dict):
+                    would_evict = shadow.get("wouldEvict")
+                    if not isinstance(would_evict, list):
+                        event.pop("shadow", None)
+                    else:
+                        shadow["wouldEvict"] = [fact_id for fact_id in would_evict if isinstance(fact_id, str) and fact_id not in removed_ids]
+                elif "shadow" in event:
+                    event.pop("shadow")
+                if isinstance(event.get("shadow"), dict):
+                    shadow = event["shadow"]
+                    actual_ids = {item.get("factId") for item in event.get("evicted", []) if isinstance(item, dict) and isinstance(item.get("factId"), str)}
+                    shadow_ids = {fact_id for fact_id in shadow["wouldEvict"] if isinstance(fact_id, str)}
+                    shadow["disagrees"] = actual_ids != shadow_ids
+                if event.get("evicted"):
+                    filtered_events.append(event)
+            if filtered_events:
+                _atomic_write(
+                    audit_path,
+                    json.dumps(filtered_events, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+            else:
+                audit_path.unlink(missing_ok=True)
+            try:
+                metadata_path.rmdir()
+            except OSError:
+                pass
 
     @staticmethod
     def _cache_key(agent_name: str | None = None, *, user_id: str | None = None) -> tuple[str | None, str | None]:
@@ -450,11 +894,42 @@ class FileMemoryStorage(MemoryStorage):
         *,
         user_id: str | None,
         agent_name: str | None,
+        committed: tuple[int, tuple[Any, ...]] | None = None,
     ) -> None:
-        """Notify the optional index only after durable storage locks are released."""
+        """Notify the optional index only after durable storage locks are released.
+
+        ``committed`` is ``(previous_revision, signature)`` of a manifest this
+        process just replaced, with ``previous_revision`` read under the user lock
+        right before the commit; a commit that changed nothing passes ``None``.
+        Once every notification lands, the user's scopes whose index was in sync
+        at ``previous_revision`` are in sync at ``signature`` too: the write was
+        the only change in between and the index carries its delta, so the next
+        search does not rebuild them. A scope synced at an older revision keeps
+        that older signature and is rebuilt, because a peer wrote the manifest
+        in between; a no-op commit leaves every recorded signature as it was.
+
+        A scope is promoted only when the delta is provably compatible with the
+        published snapshot: it is synced at exactly ``previous_revision`` and no
+        rebuild published rows for it (or storage-wide) since the generation
+        snapshot taken before the first adapter call. The SQLite lock covers
+        single adapter calls only, so ``rebuild_index`` may replace the scope's
+        rows at any point around the notifications below, and a rebuild may
+        have read its facts before this commit (resurrecting a fact this write
+        deleted) or after it (so that an older delta replayed on top reinserts
+        a fact a peer has since deleted). The scope this delta mutated therefore
+        forgets its recorded signature whenever compatibility cannot be proved,
+        so the next search's comparison rebuilds it; the user's other scopes
+        were not mutated here and are promoted when provable, else left alone.
+        """
         if self._retrieval is None:
             return
         scope = _scope_dict(user_id, agent_name)
+        key = self._cache_key(agent_name, user_id=user_id)
+        fence: tuple[int, dict[tuple[str | None, str | None], int]] | None = None
+        if committed is not None:
+            with self._cache_lock:
+                fence = (self._retrieval_index_generation, dict(self._retrieval_scope_generations))
+        failed = False
         for action, value, fact_path in notifications:
             try:
                 if action == "upsert":
@@ -462,7 +937,35 @@ class FileMemoryStorage(MemoryStorage):
                 else:
                     self._retrieval.remove(str(value), scope=scope)
             except Exception:
+                failed = True
                 logger.exception("Retrieval notification failed for %s", value)
+        # Decided under _cache_lock together with the generation reads, so a
+        # rebuild publishing concurrently is either seen here or sees the result.
+        with self._cache_lock:
+            if failed:
+                self._retrieval_dirty_scopes.add(key)
+                self._retrieval_synced_signatures.pop(key, None)
+                return
+            publication_moved = fence is None or fence[0] != self._retrieval_index_generation
+
+            def provably_compatible(synced_key: tuple[str | None, str | None]) -> bool:
+                if committed is None or fence is None or publication_moved:
+                    return False
+                synced = self._retrieval_synced_signatures.get(synced_key)
+                if synced is None or (synced[2] or 0) != committed[0]:
+                    return False
+                return self._retrieval_scope_generations.get(synced_key, 0) == fence[1].get(synced_key, 0)
+
+            if notifications and not provably_compatible(key):
+                # Rows of this scope were mutated by a delta that may be older than
+                # the published snapshot: drop the signature so the next search rebuilds.
+                self._retrieval_synced_signatures.pop(key, None)
+            if committed is None or publication_moved:
+                return
+            signature = committed[1]
+            for synced_key in [synced_key for synced_key in self._retrieval_synced_signatures if synced_key[0] == user_id]:
+                if provably_compatible(synced_key):
+                    self._retrieval_synced_signatures[synced_key] = signature
 
     @staticmethod
     def _validate_loaded_fact(
@@ -489,7 +992,12 @@ class FileMemoryStorage(MemoryStorage):
             return []
         facts: list[dict[str, Any]] = []
         for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
-            fact = _parse_fact_markdown(fact_path)
+            # Reached both unlocked (load()/reload()) and under the scope locks
+            # (save(), clear_all(), default-bucket migration); the vanished-entry
+            # skip only ever fires on the unlocked paths.
+            fact = _parse_listed_fact(fact_path)
+            if fact is None:
+                continue
             facts.append(self._validate_loaded_fact(fact, fact_path, user_id=user_id, agent_name=agent_name))
         # Shard directories are an internal layout detail and must not change
         # the stable fact order observed by callers.
@@ -626,8 +1134,10 @@ class FileMemoryStorage(MemoryStorage):
 
     @staticmethod
     def _migration_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
-        ignored = {"revision", "createdAt", "updatedAt", "scope", "title", "schemaVersion"}
-        return {key: value for key, value in left.items() if key not in ignored} == {key: value for key, value in right.items() if key not in ignored}
+        ignored = {"revision", "createdAt", "updatedAt", "scope", "title", "schemaVersion", "category", "categoryExtension"}
+        left_material = {key: value for key, value in left.items() if key not in ignored}
+        right_material = {key: value for key, value in right.items() if key not in ignored}
+        return left_material == right_material and _category_comparison_key(left) == _category_comparison_key(right)
 
     def _load_memory_file(self, path: Path) -> dict[str, Any] | None:
         if not path.exists():
@@ -856,16 +1366,13 @@ class FileMemoryStorage(MemoryStorage):
         if not sources:
             return False, from_version, []
 
-        base = global_memory or create_empty_memory()
-        migrated_summaries = {
-            "user": copy.deepcopy(base.get("user", {})),
-            "history": copy.deepcopy(base.get("history", {})),
-        }
+        migrated_summaries = _normalize_memory_summaries(global_memory or {})
         if legacy_memory is not None and adopt_legacy_summaries:
+            legacy_summaries = _normalize_memory_summaries(legacy_memory)
             for section in ("user", "history"):
                 migrated_summaries[section] = _merge_legacy_summary_section(
                     canonical=migrated_summaries[section],
-                    legacy=legacy_memory.get(section, {}),
+                    legacy=legacy_summaries[section],
                     section=section,
                     legacy_path=legacy_path,
                 )
@@ -952,6 +1459,17 @@ class FileMemoryStorage(MemoryStorage):
             raise MemoryStorageCorruption(f"Legacy facts in {path} must be a list or mapping")
         result = {key: copy.deepcopy(value) for key, value in memory_file.items() if key != "facts"}
         result.setdefault("revision", 0)
+        summary_view = normalize_memory_data(
+            {
+                "version": result.get("version"),
+                "lastUpdated": result.get("lastUpdated"),
+                "user": result.get("user"),
+                "history": result.get("history"),
+                "facts": [],
+            }
+        )
+        result["user"] = summary_view["user"]
+        result["history"] = summary_view["history"]
         result["facts"] = facts
         return result
 
@@ -991,7 +1509,7 @@ class FileMemoryStorage(MemoryStorage):
             self._memory_cache[key] = (copy.deepcopy(document), signature)
         return copy.deepcopy(document)
 
-    def reload(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
+    def reload(self, agent_name: str | None = None, *, user_id: str | None = None, _rebuild_retrieval: bool = True) -> dict[str, Any]:
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         legacy_path = self._legacy_agent_memory_path(path, agent_name) if agent_name is not None else None
@@ -1008,10 +1526,15 @@ class FileMemoryStorage(MemoryStorage):
                 migration_notifications = self._run_read_migrations_locked(path, agent_name, user_id=user_id)
         for notification_agent, notifications in migration_notifications:
             self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=notification_agent)
-        document = self._read_document(path, agent_name, user_id=user_id)
+        # Sign before reading, as load() does: a write landing in between then
+        # leaves a stale signature that forces a re-read, never a stale
+        # document cached under the new signature.
         signature = self._scope_signature(path, agent_name)
+        document = self._read_document(path, agent_name, user_id=user_id)
         with self._cache_lock:
             self._memory_cache[key] = (copy.deepcopy(document), signature)
+        if _rebuild_retrieval and agent_name is not None and self._retrieval is not None:
+            self.rebuild_index([{"userId": user_id, "agentName": agent_name}])
         return copy.deepcopy(document)
 
     def migrate(
@@ -1029,7 +1552,7 @@ class FileMemoryStorage(MemoryStorage):
             self._recover_if_needed(path)
             migrated, from_version, notifications = self._migrate_locked(path, agent_name, user_id=user_id, include_global=True)
         self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
-        document = self.reload(agent_name, user_id=user_id)
+        document = self.reload(agent_name, user_id=user_id, _rebuild_retrieval=False)
         return {
             "migrated": migrated,
             "fromVersion": from_version,
@@ -1056,6 +1579,8 @@ class FileMemoryStorage(MemoryStorage):
         key = self._cache_key(agent_name, user_id=user_id)
         lock_path = path.parent / ".memory.lock"
         notifications: list[RetrievalNotification] = []
+        deleted_metadata_ids: list[str] = []
+        committed: tuple[int, tuple[Any, ...]] | None = None
         try:
             if not isinstance(memory_data, dict):
                 raise ValueError("memory_data must be an object")
@@ -1074,20 +1599,26 @@ class FileMemoryStorage(MemoryStorage):
                 if len(ids) != len(set(ids)):
                     raise ValueError("Duplicate fact ids are not allowed")
                 old_ids = set(self._agent_entries(path, agent_name, user_id=user_id)) if agent_name is not None else set()
+                deleted_metadata_ids = sorted(old_ids - set(ids))
                 summaries = None
                 if agent_name is None:
                     summaries = {"user": memory_data.get("user", {}), "history": memory_data.get("history", {})}
-                _, notifications = self._commit_changes_locked(
+                pre_revision = int((self._load_memory_file(path) or {}).get("revision") or 0)
+                memory_file, notifications = self._commit_changes_locked(
                     path,
                     user_id=user_id,
                     agent_name=agent_name,
                     upserts=copy.deepcopy(facts_raw),
-                    deletes=sorted(old_ids - set(ids)),
+                    deletes=deleted_metadata_ids,
                     summaries=summaries,
                     expected_revision=expected_revision,
                 )
                 document = self._read_document(path, agent_name, user_id=user_id)
                 signature = self._scope_signature(path, agent_name)
+                # A no-op commit hands back the unchanged manifest: nothing was
+                # replaced, so no recorded index signature may move.
+                if int(memory_file.get("revision") or 0) != pre_revision:
+                    committed = (pre_revision, signature)
                 with self._cache_lock:
                     self._memory_cache[key] = (copy.deepcopy(document), signature)
         except MemoryRevisionConflict:
@@ -1096,7 +1627,13 @@ class FileMemoryStorage(MemoryStorage):
             logger.error("Failed to save memory scope %s: %s", key, exc)
             return False
 
-        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name, committed=committed)
+        if agent_name is not None and deleted_metadata_ids:
+            self.clear_fact_metadata(
+                agent_name=agent_name,
+                user_id=user_id,
+                fact_ids=deleted_metadata_ids,
+            )
         return True
 
     def clear_all(self, *, user_id: str | None = None) -> dict[str, Any]:
@@ -1104,6 +1641,7 @@ class FileMemoryStorage(MemoryStorage):
         path = self._get_memory_file_path(user_id=user_id)
         key = self._cache_key(user_id=user_id)
         notifications_by_agent: list[ScopedRetrievalNotifications] = []
+        metadata_agents: list[str] = []
         with (
             self._scope_lock(key),
             _process_file_lock(
@@ -1117,6 +1655,7 @@ class FileMemoryStorage(MemoryStorage):
                 for agent_dir in sorted(child for child in agents_root.iterdir() if child.is_dir()):
                     agent_name = agent_dir.name
                     validate_agent_name(agent_name)
+                    metadata_agents.append(agent_name)
                     legacy_path = self._legacy_agent_memory_path(path, agent_name)
                     if legacy_path.exists():
                         _, _, migration_notifications = self._migrate_locked(
@@ -1158,6 +1697,8 @@ class FileMemoryStorage(MemoryStorage):
 
         for agent_name, notifications in notifications_by_agent:
             self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
+        for agent_name in metadata_agents:
+            self.clear_fact_metadata(agent_name=agent_name, user_id=user_id)
         return self.reload(DEFAULT_AGENT_BUCKET, user_id=user_id)
 
     @staticmethod
@@ -1256,12 +1797,14 @@ class FileMemoryStorage(MemoryStorage):
         expected = expected_manifest_revision
         notifications: list[RetrievalNotification] = []
         memory_file: dict[str, Any] | None = None
+        committed: tuple[int, tuple[Any, ...]] | None = None
         safe_delete_rebase = not deletes or (isinstance(delete_revisions, dict) and all(str(fact_id) in delete_revisions for fact_id in deletes))
         safe_upsert_rebase = all(str(incoming["id"]) in normalized_upsert_revisions for incoming in upserts)
         for attempt in range(3):
             try:
                 with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                     self._recover_if_needed(path)
+                    pre_revision = int((self._load_memory_file(path) or {}).get("revision") or 0)
                     memory_file, notifications = self._commit_changes_locked(
                         path,
                         user_id=user_id,
@@ -1273,6 +1816,10 @@ class FileMemoryStorage(MemoryStorage):
                         delete_revisions=copy.deepcopy(delete_revisions),
                         upsert_revisions=normalized_upsert_revisions,
                     )
+                    # A no-op commit (unchanged values, empty change set) hands back
+                    # the unchanged manifest; only a real replacement may advance
+                    # the recorded index signatures.
+                    committed = (pre_revision, self._scope_signature(path, agent_name)) if int(memory_file.get("revision") or 0) != pre_revision else None
                 break
             except MemoryManifestRevisionConflict as exc:
                 can_rebase = allow_manifest_rebase and has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
@@ -1281,16 +1828,23 @@ class FileMemoryStorage(MemoryStorage):
                 current = self._load_memory_file(path)
                 expected = int((current or {}).get("revision") or 0)
                 logger.info("Rebasing disjoint memory fact change after revision conflict: %s", exc)
-        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name, committed=committed)
         if memory_file is None:  # defensive: the bounded loop either commits or raises
             raise MemoryStorageError("Memory repository change did not produce a result")
+        deleted_fact_ids = [str(value) for action, value, _ in notifications if action == "remove"]
+        if agent_name is not None and deleted_fact_ids:
+            self.clear_fact_metadata(
+                agent_name=agent_name,
+                user_id=user_id,
+                fact_ids=deleted_fact_ids,
+            )
         return {
             "complete": False,
             "version": memory_file.get("version", DOCUMENT_VERSION),
             "revision": memory_file.get("revision", 0),
             "lastUpdated": memory_file.get("lastUpdated", ""),
             "upsertedFacts": [copy.deepcopy(value) for action, value, _ in notifications if action == "upsert" and isinstance(value, dict)],
-            "deletedFactIds": [str(value) for action, value, _ in notifications if action == "remove"],
+            "deletedFactIds": deleted_fact_ids,
         }
 
     def upsert_fact(
@@ -1385,32 +1939,92 @@ class FileMemoryStorage(MemoryStorage):
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if self._retrieval is not None:
+            requested_keys = {self._cache_key(self._scope_kwargs(scope).get("agent_name"), user_id=self._scope_kwargs(scope).get("user_id")) for scope in scopes}
+            with self._cache_lock:
+                dirty = requested_keys & self._retrieval_dirty_scopes
+                synced = {key: self._retrieval_synced_signatures.get(key) for key in requested_keys}
+            for key in requested_keys - dirty:
+                user_id, agent_name = key
+                if agent_name is None:
+                    continue
+                # Another process wrote this user's memory since this process last
+                # indexed the scope: the live manifest signature no longer matches.
+                try:
+                    live_signature = self._scope_signature(self._get_memory_file_path(agent_name, user_id=user_id), agent_name)
+                except (OSError, ValueError, MemoryStorageCorruption) as exc:
+                    # The local index exists to decouple search from the shared
+                    # volume: a transient read error or a corrupt manifest must not
+                    # fail a search the index can answer. Serve it as is and keep the
+                    # recorded signature so the next search compares again; a dirty
+                    # mark would send the rebuild into the same failing read.
+                    logger.warning("Memory retrieval freshness check skipped for user %r agent %r; serving the local index: %s", user_id, agent_name, exc)
+                    logger.debug("Memory retrieval freshness check failure", exc_info=exc)
+                    continue
+                if synced[key] != live_signature:
+                    dirty.add(key)
+            if dirty:
+                dirty_scopes = [{"userId": user_id, "agentName": agent_name} for user_id, agent_name in dirty]
+                rebuild_result = self.rebuild_index(dirty_scopes)
+                if rebuild_result.get("failed"):
+                    return self._search_substring(query, scopes=scopes, top_k=top_k, filters=filters)
             return self._retrieval.search(query, scopes=scopes, top_k=top_k, mode=mode, filters=filters)
+        return self._search_substring(query, scopes=scopes, top_k=top_k, filters=filters)
+
+    def _search_substring(
+        self,
+        query: str,
+        *,
+        scopes: list[dict[str, str | None]],
+        top_k: int,
+        filters: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
         query_lower = query.strip().lower()
         if not query_lower or top_k <= 0:
             return []
         results: list[dict[str, Any]] = []
         for scope in scopes:
-            facts = self.list_facts(filters=filters, **self._scope_kwargs(scope))
-            for fact in facts:
+            # The ranking covers the whole scope, so read the complete scope
+            # rather than a list_facts page.
+            for fact in self.load(**self._scope_kwargs(scope)).get("facts", []):
+                if filters and not all(key in fact and fact.get(key) == value for key, value in filters.items()):
+                    continue
                 content = fact.get("content")
                 if isinstance(content, str) and query_lower in content.lower():
-                    results.append({"fact": fact, "score": float(fact.get("confidence") or 0.5), "matchType": "substring"})
+                    # 0.0 is a persisted confidence _normalize_fact accepts; only unset/null defaults.
+                    confidence = fact.get("confidence")
+                    score = 0.5 if confidence is None else float(confidence)
+                    results.append({"fact": fact, "score": score, "matchType": "substring"})
         results.sort(key=lambda result: result["score"], reverse=True)
         return results[:top_k]
 
     def rebuild_index(self, scopes: list[dict[str, str | None]] | None = None) -> dict[str, Any]:
         if self._retrieval is None:
             return {"supported": False, "indexed": 0, "failed": 0, "reason": "retrieval_not_configured"}
+        records: list[tuple[dict[str, Any], dict[str, str | None], str]] = []
         indexed = 0
         failed = 0
+        # Manifest signatures taken before each scope's facts are read. A write that
+        # races the rebuild leaves a newer live signature, so the scope is re-synced on
+        # its next search instead of hiding behind a signature taken after a stale read.
+        synced_signatures: dict[tuple[str | None, str | None], tuple[Any, ...]] = {}
         if scopes is None:
             root = Path(self._config.storage_path) if self._config.storage_path else memory_file_path(self._config).parent
             candidates = root.glob("**/facts/**/*.md")
+            # One signature per manifest: every agent bucket of a user shares its
+            # memory.json, and _scope_signature reads only that file.
+            manifest_signatures: dict[Path, tuple[Any, ...]] = {}
             for path in candidates:
                 try:
-                    fact = _parse_fact_markdown(path)
                     relative_parts = path.relative_to(root).parts
+                    manifest_path: Path | None = None
+                    if "agents" in relative_parts[:-1]:
+                        agents_index = relative_parts.index("agents")
+                        manifest_path = root.joinpath(*relative_parts[:agents_index]) / self._config.manifest_filename
+                        if manifest_path not in manifest_signatures:
+                            manifest_signatures[manifest_path] = self._scope_signature(manifest_path, relative_parts[agents_index + 1])
+                    fact = _parse_listed_fact(path)
+                    if fact is None:
+                        continue
                     agents_index = relative_parts.index("agents")
                     expected_agent = relative_parts[agents_index + 1]
                     expected_user_bucket = relative_parts[1] if len(relative_parts) > 1 and relative_parts[0] == "users" else None
@@ -1422,8 +2036,9 @@ class FileMemoryStorage(MemoryStorage):
                         raise MemoryStorageCorruption(f"Fact user scope does not match directory for {path}")
                     validate_agent_name(expected_agent)
                     self._validate_loaded_fact(fact, path, user_id=original_user, agent_name=expected_agent)
-                    self.notify_fact_upsert(fact, path=str(path))
-                    indexed += 1
+                    if manifest_path is not None:
+                        synced_signatures.setdefault(self._cache_key(expected_agent, user_id=original_user), manifest_signatures[manifest_path])
+                    records.append((fact, _scope_dict(original_user, expected_agent), str(path)))
                 except Exception:
                     logger.exception("Failed to rebuild retrieval index for %s", path)
                     failed += 1
@@ -1434,13 +2049,88 @@ class FileMemoryStorage(MemoryStorage):
                 agent_name = kwargs.get("agent_name")
                 if agent_name is None:
                     continue
-                for fact in self.list_facts(**kwargs):
+                synced_signatures[self._cache_key(agent_name, user_id=kwargs.get("user_id"))] = self._scope_signature(memory_path, agent_name)
+                # The bulk replace below drops every row this rebuild does not
+                # supply, so read the complete scope rather than a list_facts page.
+                for fact in self.load(**kwargs).get("facts", []):
                     try:
-                        self.notify_fact_upsert(fact, path=str(fact_file_path(memory_path, fact["id"], agent_name=agent_name)))
+                        records.append((fact, _scope_dict(kwargs.get("user_id"), agent_name), str(fact_file_path(memory_path, fact["id"], agent_name=agent_name))))
+                    except Exception:
+                        logger.exception("Failed to rebuild retrieval index for fact %s", fact.get("id"))
+                        failed += 1
+
+        requested_keys = None if scopes is None else {self._cache_key(self._scope_kwargs(scope).get("agent_name"), user_id=self._scope_kwargs(scope).get("user_id")) for scope in scopes}
+
+        def bump_generations() -> None:
+            """Fence in-flight signature promotions off the scopes published here (caller holds _cache_lock)."""
+            if requested_keys is None:
+                self._retrieval_index_generation += 1
+            else:
+                for key in requested_keys:
+                    self._retrieval_scope_generations[key] = self._retrieval_scope_generations.get(key, 0) + 1
+
+        def mark_synced() -> None:
+            with self._cache_lock:
+                bump_generations()
+                if requested_keys is None:
+                    self._retrieval_dirty_scopes.clear()
+                    self._retrieval_synced_signatures = synced_signatures
+                else:
+                    self._retrieval_dirty_scopes.difference_update(requested_keys)
+                    self._retrieval_synced_signatures.update(synced_signatures)
+
+        def forget_synced() -> None:
+            with self._cache_lock:
+                bump_generations()
+                if requested_keys is None:
+                    self._retrieval_synced_signatures.clear()
+                else:
+                    for key in requested_keys:
+                        self._retrieval_synced_signatures.pop(key, None)
+
+        # Row replacement and signature publication form one unit under
+        # _retrieval_publish_lock. The adapter lock ends when the install
+        # returns, so two overlapping refreshes of one scope could otherwise
+        # install in one order and publish in the other, and the later (live)
+        # signature would certify the earlier refresh's stale rows. Serialized,
+        # whichever installs last also publishes last, and a stale captured
+        # signature published last is caught by the next search's compare.
+        # Fact reading above stays outside the lock so a slow read never blocks
+        # refreshes of other scopes. The startup full rebuild holds it for its
+        # single bulk install; scoped refreshes wait for that, which is fine
+        # because before warm-up completes a search would be rebuilding its
+        # scope anyway. Lock order: callers hold no storage lock here
+        # (search_facts releases _cache_lock first; reload() leaves its
+        # scope/file-lock block before rebuilding; DeerMem's warm-up lock is an
+        # outer RLock that nothing inside acquires), and only the adapter's own
+        # lock and _cache_lock are taken inside, both leaf locks.
+        with self._retrieval_publish_lock:
+            bulk_rebuild = getattr(self._retrieval, "rebuild", None)
+            if callable(bulk_rebuild):
+                try:
+                    bulk_rebuild(records, scopes=scopes)
+                    indexed = len(records)
+                    mark_synced()
+                except Exception:
+                    logger.exception("Failed to atomically rebuild retrieval index")
+                    failed += len(records) or 1
+                    forget_synced()
+                    return {"supported": True, "indexed": indexed, "failed": failed, "fatal": True}
+            else:
+                clear = getattr(self._retrieval, "clear", None)
+                if callable(clear):
+                    clear(scopes=scopes)
+                for fact, scope, path in records:
+                    try:
+                        self.notify_fact_upsert(fact, path=path)
                         indexed += 1
                     except Exception:
                         logger.exception("Failed to rebuild retrieval index for fact %s", fact.get("id"))
                         failed += 1
+                if failed == 0:
+                    mark_synced()
+                else:
+                    forget_synced()
         return {"supported": True, "indexed": indexed, "failed": failed}
 
     def retrieval_status(self) -> dict[str, Any]:
@@ -1459,14 +2149,23 @@ class FileMemoryStorage(MemoryStorage):
 def create_storage(config: DeerMemConfig, retrieval: RetrievalPort | None = None) -> MemoryStorage:
     if retrieval is None and config.retrieval_adapter:
         try:
-            module_path, factory_name = config.retrieval_adapter.rsplit(".", 1)
-            factory = getattr(importlib.import_module(module_path), factory_name)
+            if config.retrieval_adapter == "fts5":
+                from .retrieval import create_fts5_retrieval
+
+                factory = create_fts5_retrieval
+            else:
+                module_path, factory_name = config.retrieval_adapter.rsplit(".", 1)
+                factory = getattr(importlib.import_module(module_path), factory_name)
             retrieval = factory(config)
         except Exception as exc:
             raise ValueError(f"backend_config.retrieval_adapter={config.retrieval_adapter!r} failed to load: {exc}") from exc
     storage_class_path = config.storage_class
     if not storage_class_path or storage_class_path == "file":
         return FileMemoryStorage(config, retrieval=retrieval)
+    if storage_class_path == "markdown":
+        from .markdown_storage import MarkdownMemoryStorage
+
+        return MarkdownMemoryStorage(config, retrieval=retrieval)
     try:
         module_path, class_name = storage_class_path.rsplit(".", 1)
         storage_class = getattr(importlib.import_module(module_path), class_name)
