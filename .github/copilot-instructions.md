@@ -94,9 +94,9 @@ make dev
 Behavior:
 
 - Stops existing local services first.
-- Starts LangGraph (`2024`), Gateway (`8001`), Frontend (`3000`), nginx (`2026`).
+- Starts Gateway (`8001`, with the embedded LangGraph-compatible runtime), Frontend (`3000`), nginx (`2026`). There is no standalone LangGraph service.
 - Unified app endpoint: `http://localhost:2026`.
-- Logs: `logs/langgraph.log`, `logs/gateway.log`, `logs/frontend.log`, `logs/nginx.log`.
+- Logs: `logs/gateway.log`, `logs/frontend.log`, `logs/nginx.log`.
 
 Stop services:
 
@@ -143,12 +143,12 @@ Root-level orchestration and config:
 
 Backend core:
 
-- `backend/src/agents/` - lead agent, middleware chain, memory
-- `backend/src/gateway/` - FastAPI gateway API
-- `backend/src/sandbox/` - sandbox provider + tool wrappers
-- `backend/src/subagents/` - subagent registry/execution
-- `backend/src/mcp/` - MCP integration
-- `backend/langgraph.json` - graph entrypoint (`src.agents:make_lead_agent`)
+- `backend/packages/harness/deerflow/agents/` - lead agent, middleware chain, memory
+- `backend/app/gateway/` - FastAPI gateway API
+- `backend/packages/harness/deerflow/sandbox/` - sandbox provider + tool wrappers
+- `backend/packages/harness/deerflow/subagents/` - subagent registry/execution
+- `backend/packages/harness/deerflow/mcp/` - MCP integration
+- `backend/langgraph.json` - graph entrypoint (`deerflow.agents:make_lead_agent`)
 - `backend/pyproject.toml` - Python deps and `requires-python`
 - `backend/ruff.toml` - lint/format policy
 - `backend/tests/` - backend unit and integration-like tests
@@ -229,8 +229,3 @@ Only do broad repo searches (`grep/find/code search`) when:
 - you need file-level implementation details not listed here,
 - a command here fails and you need updated replacement behavior,
 - or CI/workflow definitions have changed since this file was written.
-
-## AgentHub Integration
-- Skills: `.agents/skills/` in this repo links to shared AgentHub skills
-- 14 shared agents available (api, architect, cli, deploy, developer, docker, docs, orchestrator, performance, refactor, reviewer, security, tester, troubleshoot)
-- MCP: 12 servers (GitHub, Supabase, Playwright, MongoDB, Notion, HuggingFace, etc.)
