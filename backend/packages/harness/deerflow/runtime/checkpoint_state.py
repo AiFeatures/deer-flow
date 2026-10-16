@@ -25,6 +25,7 @@ from deerflow.runtime.checkpoint_mode import (
     aensure_checkpoint_mode_compatible,
     ensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
+    raise_if_checkpoint_tuple_incompatible,
     raise_if_snapshot_incompatible,
 )
 
@@ -33,7 +34,13 @@ def _finish_state_mutation(_state: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def build_state_mutation_graph(as_node: str, mode: CheckpointChannelMode, state_schema: Any | None = None) -> Any:
+def build_state_mutation_graph(
+    as_node: str,
+    mode: CheckpointChannelMode,
+    state_schema: Any | None = None,
+    *,
+    snapshot_frequency: int | None = None,
+) -> Any:
     """Compile a state-only graph whose single writer node finishes immediately.
 
     ``update_state(..., as_node=...)`` requires the node to be registered in
@@ -45,12 +52,15 @@ def build_state_mutation_graph(as_node: str, mode: CheckpointChannelMode, state_
     assistant graph was compiled with) whenever the write carries materialized
     state: the base ThreadState fallback does not know channels contributed by
     custom middleware, and writes to unknown channels are silently discarded.
+    The fallback resolves the delta snapshot cadence explicit arg ->
+    process-frozen -> config default; an explicit ``state_schema`` already
+    carries its cadence in its identity.
     """
     if not as_node:
         raise ValueError("as_node is required for checkpoint state mutation")
     from langgraph.graph import StateGraph
 
-    builder = StateGraph(state_schema if state_schema is not None else get_thread_state_schema(mode))
+    builder = StateGraph(state_schema if state_schema is not None else get_thread_state_schema(mode, snapshot_frequency))
     builder.add_node(as_node, _finish_state_mutation)
     builder.set_entry_point(as_node)
     builder.set_finish_point(as_node)
@@ -139,6 +149,28 @@ class CheckpointStateAccessor:
         snapshot = await self.graph.aget_state(prepared)
         raise_if_snapshot_incompatible(snapshot, self.mode)
         return snapshot
+
+    def get_tuple(self, config: dict[str, Any]) -> Any | None:
+        """Raw checkpoint tuple for a config, without materializing state."""
+
+        return self.checkpointer.get_tuple(self._prepare_config(config))
+
+    async def aget_tuple(self, config: dict[str, Any]) -> Any | None:
+        """Raw checkpoint tuple for a config, without materializing state."""
+
+        return await self.checkpointer.aget_tuple(self._prepare_config(config))
+
+    def get_metadata(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Read checkpoint metadata without materializing channel state."""
+        checkpoint_tuple = self.checkpointer.get_tuple(self._prepare_config(config))
+        raise_if_checkpoint_tuple_incompatible(checkpoint_tuple, self.mode)
+        return dict(getattr(checkpoint_tuple, "metadata", {}) or {})
+
+    async def aget_metadata(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Read checkpoint metadata without materializing channel state."""
+        checkpoint_tuple = await self.checkpointer.aget_tuple(self._prepare_config(config))
+        raise_if_checkpoint_tuple_incompatible(checkpoint_tuple, self.mode)
+        return dict(getattr(checkpoint_tuple, "metadata", {}) or {})
 
     def history(self, config: dict[str, Any], *, limit: int | None = None) -> list[Any]:
         prepared = self._prepare_config(config)

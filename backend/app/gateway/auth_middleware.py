@@ -9,6 +9,7 @@ owner filtering works automatically via the sentinel pattern.
 Fine-grained permission checks remain in authz.py decorators.
 """
 
+import logging
 from collections.abc import Callable
 
 from fastapi import HTTPException, Request, Response
@@ -20,13 +21,17 @@ from app.gateway.auth.errors import AuthErrorCode, AuthErrorResponse
 from app.gateway.auth_disabled import (
     AUTH_SOURCE_AUTH_DISABLED,
     AUTH_SOURCE_INTERNAL,
+    AUTH_SOURCE_PAT,
     AUTH_SOURCE_SESSION,
     get_auth_disabled_user,
     is_auth_disabled,
 )
-from app.gateway.authz import _ALL_PERMISSIONS, AuthContext
+from app.gateway.authz import AuthContext, resolve_route_permissions
 from app.gateway.internal_auth import INTERNAL_AUTH_HEADER_NAME, get_internal_user, is_valid_internal_auth_token
+from app.gateway.request_path import get_request_route_path
 from deerflow.runtime.user_context import reset_current_user, set_current_user
+
+logger = logging.getLogger(__name__)
 
 # Paths that never require authentication.
 _PUBLIC_PATH_PREFIXES: tuple[str, ...] = (
@@ -86,7 +91,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if _is_public(request.url.path):
+        if _is_public(get_request_route_path(request)):
             return await call_next(request)
 
         internal_user = None
@@ -102,14 +107,71 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if owner_user_id:
                 owner_user_id = owner_user_id.strip()
             internal_user = get_internal_user(owner_user_id=owner_user_id or None)
+            if owner_user_id and not is_auth_disabled():
+                # The internal principal is synthesized from trusted headers
+                # without a users-row lookup, so suspension has no other chance
+                # to bite on this surface (#3462 gap 3): enforce it here, the
+                # one gate every owner-bound internal HTTP call (IM channel
+                # dispatch above all) passes through. Auth-disabled mode is
+                # exempt — its owner header carries the synthetic
+                # auth-disabled identity and no suspendable account exists.
+                # Owner ids without a users row stay allowed (a nonexistent
+                # account cannot be suspended), and a store that cannot be
+                # read cannot hold a suspension verdict either; run admission
+                # re-asserts the check when the row is readable.
+                from app.gateway.deps import get_local_provider
+
+                try:
+                    owner = await get_local_provider().get_user(owner_user_id)
+                except Exception:
+                    logger.warning("Internal-owner suspension check skipped: users lookup failed", exc_info=True)
+                    owner = None
+                if owner is not None and getattr(owner, "disabled", False):
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "detail": AuthErrorResponse(
+                                code=AuthErrorCode.ACCOUNT_DISABLED,
+                                message="Account disabled",
+                            ).model_dump()
+                        },
+                    )
 
         auth_source = AUTH_SOURCE_SESSION
         access_token = request.cookies.get("access_token")
+        authorization = request.headers.get("authorization")
+        pat_scopes: frozenset[str] = frozenset()
 
         # Non-public path: require session cookie
         if internal_user is not None:
             user = internal_user
             auth_source = AUTH_SOURCE_INTERNAL
+        elif authorization is not None and not is_auth_disabled():
+            # Bearer (PAT) credential precedence (#4849): a present-but-invalid
+            # Authorization header is a hard 401 and never silently falls back
+            # to the session cookie. This is also what makes the CSRF
+            # middleware's Bearer skip safe — a cross-site attacker cannot ride
+            # a victim's cookie by padding the request with a garbage Bearer
+            # header, because the request dies here before any route runs.
+            # Auth-disabled mode is an operator override of all authentication,
+            # so it stays ahead of the Bearer check (a stray Authorization
+            # header from a proxy must not 401 an E2E sandbox).
+            from app.gateway.auth.pat import authenticate_pat, is_pat_allowed_route
+
+            try:
+                user, pat_scopes = await authenticate_pat(request.app, authorization)
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            # Default-deny route boundary (#5041 review P1-1): scopes only
+            # constrain @require_permission routes, so any route outside the
+            # explicit PAT policy is closed to PAT callers outright — an
+            # all-scopes token must not reach undecorated mutation routes.
+            if not is_pat_allowed_route(request.method, get_request_route_path(request)):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "PAT credentials are not permitted on this route"},
+                )
+            auth_source = AUTH_SOURCE_PAT
         elif access_token:
             # Strict JWT validation: reject junk/expired tokens with 401
             # right here instead of silently passing through. This closes
@@ -151,7 +213,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # JWT-decode + DB-lookup pipeline a second time per request).
         request.state.user = user
         request.state.auth_source = auth_source
-        request.state.auth = AuthContext(user=user, permissions=_ALL_PERMISSIONS)
+        permissions = await resolve_route_permissions(
+            user,
+            is_internal=auth_source == AUTH_SOURCE_INTERNAL,
+        )
+        if auth_source == AUTH_SOURCE_PAT:
+            # A PAT can only narrow its owning user's permissions: the stored
+            # scopes intersect the resolved route permissions, never widen
+            # them, and role changes / authorization policy stay authoritative
+            # because they were resolved fresh from the owning user above.
+            permissions = [permission for permission in permissions if permission in pat_scopes]
+        request.state.auth = AuthContext(user=user, permissions=permissions)
         token = set_current_user(user)
         try:
             return await call_next(request)

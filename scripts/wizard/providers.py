@@ -176,6 +176,50 @@ LLM_PROVIDERS: list[LLMProvider] = [
         },
     ),
     LLMProvider(
+        name="zai",
+        display_name="Z.AI GLM-5.3-Flash",
+        description="GLM-5.3-Flash with required thinking, low/high/max effort, and native vision",
+        use="deerflow.models.patched_deepseek:PatchedChatDeepSeek",
+        models=["glm-5.3-flash"],
+        default_model="glm-5.3-flash",
+        env_var="ZAI_API_KEY",
+        package="langchain-deepseek",
+        extra_config={
+            "api_base": "https://api.z.ai/api/paas/v4",
+            "timeout": 600.0,
+            "max_retries": 2,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": 131072,
+            "context_window": 1000000,
+            "supports_vision": True,
+            # Declarative reasoning contract (issue #5073). GLM-5.3-Flash cannot
+            # disable thinking and only accepts low/high/max effort, so the
+            # contract keeps thinking on for every foreground and background
+            # call, maps DeerFlow's generic minimal/medium presets onto the
+            # provider vocabulary, and serializes clear_thinking=true so the
+            # model does not require exact reasoning replay after summarization.
+            # `default` also governs callers that never choose an effort
+            # (summarization, title generation, subagents), so it stays at
+            # `high` rather than the provider's deepest `max`; `max` remains
+            # selectable in the composer.
+            "reasoning": {
+                "thinking": "required",
+                "dialect": "openai_extra_body",
+                "history": "clear",
+                "effort": {
+                    "values": ["low", "high", "max"],
+                    "default": "high",
+                    "aliases": {"minimal": "low", "medium": "high"},
+                },
+            },
+            "extra_body": {"tool_stream": True},
+            # Z.AI streams terminal usage without requiring OpenAI's undocumented
+            # stream_options.include_usage request field.
+            "stream_usage": False,
+        },
+    ),
+    LLMProvider(
         name="openai",
         display_name="OpenAI",
         description="GPT-5, GPT-4.1, GPT-4o",
@@ -435,6 +479,40 @@ LLM_PROVIDERS: list[LLMProvider] = [
         },
     ),
     LLMProvider(
+        name="orcarouter",
+        display_name="OrcaRouter",
+        description="OpenAI-compatible adaptive routing gateway",
+        use="langchain_openai:ChatOpenAI",
+        models=["openai/gpt-5.5", "anthropic/claude-opus-4.8", "google/gemini-3.5-flash", "orcarouter/auto"],
+        default_model="openai/gpt-5.5",
+        env_var="ORCAROUTER_API_KEY",
+        package="langchain-openai",
+        extra_config={
+            "base_url": "https://api.orcarouter.ai/v1",
+            "request_timeout": 600.0,
+            "max_retries": 2,
+            "max_tokens": 8192,
+            "temperature": 0.7,
+        },
+    ),
+    LLMProvider(
+        name="opper",
+        display_name="Opper",
+        description="EU-hosted AI gateway, 700+ models behind one OpenAI-compatible API",
+        use="langchain_openai:ChatOpenAI",
+        models=["claude-sonnet-4-6", "gpt-5.5", "gemini-3.8-flash", "gpt-5.4-mini"],
+        default_model="claude-sonnet-4-6",
+        env_var="OPPER_API_KEY",
+        package="langchain-openai",
+        extra_config={
+            "base_url": "https://api.opper.ai/v3/compat",
+            "request_timeout": 600.0,
+            "max_retries": 2,
+            "max_tokens": 8192,
+            "temperature": 0.7,
+        },
+    ),
+    LLMProvider(
         name="vllm",
         display_name="vLLM",
         description="Self-hosted OpenAI-compatible serving",
@@ -590,11 +668,46 @@ SEARCH_PROVIDERS: list[SearchProvider] = [
         extra_config={"max_results": 5},
     ),
     SearchProvider(
+        name="serply",
+        display_name="Serply",
+        description="Google Search, News and Scholar results, API key required",
+        use="deerflow.community.serply.tools:web_search_tool",
+        env_var="SERPLY_API_KEY",
+        extra_config={"max_results": 5},
+    ),
+    SearchProvider(
+        name="sofya",
+        display_name="Sofya",
+        description="Search results include page content, API key required",
+        use="deerflow.community.sofya.tools:web_search_tool",
+        env_var="SOFYA_API_KEY",
+        extra_config={"max_results": 5, "contents_max_characters": 2000},
+    ),
+    SearchProvider(
         name="groundroute",
         display_name="GroundRoute",
         description="One key across six engines, price-routed with failover, API key required",
         use="deerflow.community.groundroute.tools:web_search_tool",
         env_var="GROUNDROUTE_API_KEY",
+        extra_config={"max_results": 5},
+    ),
+    SearchProvider(
+        name="webz",
+        display_name="Webz.io News Search",
+        description="Recent news search (not general web search), API key required",
+        use="deerflow.community.webz.tools:web_search_tool",
+        env_var="WEBZ_API_KEY",
+        extra_config={"max_results": 5},
+    ),
+    SearchProvider(
+        name="youcom",
+        display_name="You.com",
+        description="Own index with extracted page snippets, free tier needs no key",
+        use="deerflow.community.youcom.tools:web_search_tool",
+        # No env_var: the provider falls back to You.com's keyless endpoint, so the
+        # wizard should not demand a key. Operators who have one set YDC_API_KEY in
+        # .env (or api_key in config.yaml) and the provider switches endpoints.
+        env_var=None,
         extra_config={"max_results": 5},
     ),
 ]
@@ -648,6 +761,22 @@ WEB_FETCH_PROVIDERS: list[WebProvider] = [
         description="Firecrawl-compatible web scraper with markdown output, self-host or cloud",
         use="deerflow.community.fastcrw.tools:web_fetch_tool",
         env_var="CRW_API_KEY",
+        tool_name="web_fetch",
+    ),
+    WebProvider(
+        name="sofya",
+        display_name="Sofya",
+        description="Page as markdown, API key required",
+        use="deerflow.community.sofya.tools:web_fetch_tool",
+        env_var="SOFYA_API_KEY",
+        tool_name="web_fetch",
+    ),
+    WebProvider(
+        name="unbrowse",
+        display_name="Unbrowse",
+        description="Page as markdown, cloud browser for JavaScript pages, API key required",
+        use="deerflow.community.unbrowse.tools:web_fetch_tool",
+        env_var="UNBROWSE_API_KEY",
         tool_name="web_fetch",
     ),
     WebProvider(

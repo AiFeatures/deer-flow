@@ -16,6 +16,7 @@ describe("ArtifactLink rendering", () => {
     expect(html).toContain("<span");
     expect(html).toContain("click me");
     expect(html).not.toContain("href=");
+    expect(html).toContain('aria-label="Unsafe link omitted"');
   });
 
   it("renders a safe https href as a hardened anchor", () => {
@@ -26,6 +27,18 @@ describe("ArtifactLink rendering", () => {
     expect(html).toContain('href="https://example.com/x"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');
+  });
+
+  it("renders citation labels when children are React elements", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        ArtifactLink,
+        { href: "https://example.com/report" },
+        createElement("span", null, "citation:Test Source"),
+      ),
+    );
+    expect(html).not.toContain("citation:");
+    expect(html).toContain("Test Source");
   });
 
   it("renders scheme-less relative hrefs as navigable anchors", () => {

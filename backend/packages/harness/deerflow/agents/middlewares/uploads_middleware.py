@@ -5,6 +5,7 @@ on demand via the ``list_uploaded_files`` tool.
 """
 
 import logging
+import math
 from collections import Counter
 from pathlib import Path
 from typing import NotRequired, override
@@ -17,7 +18,7 @@ from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.input_sanitization_middleware import neutralize_untrusted_tags
 from deerflow.config.paths import Paths, get_paths
-from deerflow.runtime.user_context import get_effective_user_id
+from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.uploads.manager import is_upload_staging_file
 from deerflow.utils.file_outline import extract_outline_for_file
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, message_content_to_text
@@ -25,6 +26,7 @@ from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, message_content_t
 logger = logging.getLogger(__name__)
 
 _MAX_FILES_PER_CONTEXT_SECTION = 10
+_MAX_DISPLAY_FILE_SIZE_BYTES = 1024**4
 
 
 def _extension_label(file: dict) -> str:
@@ -84,8 +86,11 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         document cannot embed blocked authority tags inside the trusted
         ``<current_uploads>`` wrapper.
         """
-        size_kb = file["size"] / 1024
-        size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
+        if file["size"] >= _MAX_DISPLAY_FILE_SIZE_BYTES:
+            size_str = ">= 1 TB"
+        else:
+            size_kb = file["size"] / 1024
+            size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
         lines.append(f"- {neutralize_untrusted_tags(file['filename'])} ({size_str})")
         lines.append(f"  Path: {neutralize_untrusted_tags(file['path'])}")
         if file.get("selection_reason") == "query_match":
@@ -160,6 +165,29 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _coerce_file_size(value: object) -> int:
+        """Best-effort byte count from a client-supplied ``files[*].size``.
+
+        The value only feeds the human-readable size in ``<current_uploads>``,
+        and every other field in ``_files_from_kwargs`` is validated fail-soft,
+        so an unusable size must never abort the run: anything that is not a
+        non-negative finite number (``"abc"``, a list, a bool, ``-5``, ``inf``)
+        falls back to ``0``, the same value a missing size gets. Values that
+        parse as integers but overflow the floating-point KB display also use
+        that fallback. Numeric strings such as ``"2048"`` keep working.
+        """
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            size = int(value)
+            if size < 0 or not math.isfinite(size / 1024):
+                return 0
+        except (TypeError, ValueError, OverflowError):
+            # Both int(value) and the subsequent KB division can overflow.
+            return 0
+        return size
+
     def _files_from_kwargs(self, message: HumanMessage, uploads_dir: Path | None = None) -> list[dict] | None:
         """Extract file info from message additional_kwargs.files.
 
@@ -183,17 +211,26 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         for f in kwargs_files:
             if not isinstance(f, dict):
                 continue
-            filename = f.get("filename") or ""
-            if not filename or Path(filename).name != filename or is_upload_staging_file(filename):
+            filename = f.get("filename")
+            if not isinstance(filename, str) or not filename or "\x00" in filename:
                 continue
-            if uploads_dir is not None and not (uploads_dir / filename).is_file():
+            try:
+                file_path = Path(filename)
+                if file_path.name != filename or is_upload_staging_file(filename):
+                    continue
+                if uploads_dir is not None and not (uploads_dir / filename).is_file():
+                    continue
+            except (OSError, ValueError) as error:
+                # Invalid references and unavailable entries are per-file
+                # failures; they must not suppress valid sibling uploads.
+                logger.debug("Skipping uploaded file %r after %s during its filesystem probe: %s", filename, type(error).__name__, error)
                 continue
             files.append(
                 {
                     "filename": filename,
-                    "size": int(f.get("size") or 0),
+                    "size": self._coerce_file_size(f.get("size")),
                     "path": f"/mnt/user-data/uploads/{filename}",
-                    "extension": Path(filename).suffix,
+                    "extension": file_path.suffix,
                 }
             )
         return files if files else None
@@ -226,11 +263,17 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
                 thread_id = get_config().get("configurable", {}).get("thread_id")
             except RuntimeError:
                 pass
-        uploads_dir = self._paths.sandbox_uploads_dir(thread_id, user_id=get_effective_user_id()) if thread_id else None
+        uploads_dir = self._paths.sandbox_uploads_dir(thread_id, user_id=resolve_runtime_user_id(runtime)) if thread_id else None
 
         # Get newly uploaded files from the current message's additional_kwargs.files
         new_files = self._files_from_kwargs(last_message, uploads_dir) or []
         if not new_files:
+            if (last_message.additional_kwargs or {}).get("files"):
+                logger.info(
+                    "UploadsMiddleware: files metadata was present but no files were found on disk (thread_id=%s, uploads_dir=%s)",
+                    thread_id,
+                    uploads_dir,
+                )
             # Clear stale uploaded_files so list_uploaded_files doesn't
             # exclude files that became historical after the previous turn.
             return {"uploaded_files": []}
@@ -272,11 +315,8 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         else:
             updated_content = original_content
 
-        updated_message = HumanMessage(
-            content=updated_content,
-            id=last_message.id,
-            name=last_message.name,
-            additional_kwargs=additional_kwargs,
+        updated_message = last_message.model_copy(
+            update={"content": updated_content, "additional_kwargs": additional_kwargs},
         )
 
         messages[last_message_index] = updated_message
@@ -294,7 +334,9 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         ``stat``, reading sibling ``.md`` outlines). When the graph runs async,
         langgraph would otherwise execute the sync hook directly on the event
         loop, so it is dispatched to a worker thread via ``run_in_executor``.
-        ``run_in_executor`` copies the current context, so the ``user_id``
-        contextvar read by ``get_effective_user_id()`` is preserved.
+        ``run_in_executor`` copies the current context, preserving both
+        LangGraph's runnable config and DeerFlow's request ContextVar fallback.
+        The runtime itself is also passed explicitly for the authoritative
+        ``runtime.context["user_id"]`` channel.
         """
         return await run_in_executor(None, self.before_agent, state, runtime)

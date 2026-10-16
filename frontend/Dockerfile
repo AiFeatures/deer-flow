@@ -1,7 +1,8 @@
-# Frontend Development Dockerfile
-FROM node:22-alpine
+# Frontend Dockerfile
+# Supports two targets:
+#   --target dev   — install deps only, run `pnpm dev` at container start
+#   --target prod  — full build baked in, run `pnpm start` at container start (default if no --target is specified)
 
-# Accept build argument for pnpm store path
 ARG PNPM_STORE_PATH=/root/.local/share/pnpm/store
 ARG NPM_REGISTRY
 
@@ -20,12 +21,12 @@ RUN pnpm config set store-dir ${PNPM_STORE_PATH}
 # Optionally override npm registry for restricted networks (e.g. NPM_REGISTRY=https://registry.npmmirror.com)
 RUN if [ -n "${NPM_REGISTRY}" ]; then pnpm config set registry "${NPM_REGISTRY}"; fi
 WORKDIR /app
-
-# Copy frontend source code
 COPY frontend ./frontend
 
-# Install dependencies
-RUN sh -c "cd /app/frontend && pnpm install --frozen-lockfile"
+# ── Dev: install only, CMD is overridden by docker-compose ───────────────────
+FROM base AS dev
+RUN cd /app/frontend && pnpm install --frozen-lockfile
+EXPOSE 3000
 
 # ── Builder: install + compile Next.js ───────────────────────────────────────
 FROM base AS builder
@@ -51,3 +52,4 @@ RUN if [ -n "${NPM_REGISTRY}" ]; then pnpm config set registry "${NPM_REGISTRY}"
 WORKDIR /app
 COPY --from=builder /app/frontend ./frontend
 EXPOSE 3000
+CMD ["sh", "-c", "cd /app/frontend && pnpm start"]

@@ -5,13 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from deerflow.config.extensions_config import ExtensionsConfig, McpOAuthConfig
+from deerflow.mcp.headers import apply_header_overrides, header_spellings, illegal_header_value_reason
 
 logger = logging.getLogger(__name__)
+
+# Used when the token endpoint omits ``expires_in`` or returns a value the
+# manager cannot turn into a lifetime.
+_DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
 
 
 @dataclass
@@ -23,12 +29,22 @@ class _OAuthToken:
     expires_at: datetime
 
 
+@dataclass
+class _OAuthState:
+    """One connection's mutable tokens and cross-loop refresh lock."""
+
+    config: McpOAuthConfig
+    token: _OAuthToken | None = None
+    # Sync tool wrappers and the Gateway can refresh from different loops.
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class OAuthTokenManager:
     """Acquire/cache/refresh OAuth tokens for MCP servers."""
 
     def __init__(self, oauth_by_server: dict[str, McpOAuthConfig]):
-        self._oauth_by_server = oauth_by_server
-        self._tokens: dict[str, _OAuthToken] = {}
+        # Refresh-token rotation belongs to runtime state, not the parsed config
+        # used by cache/snapshot validation or custom interceptor builders.
         # A plain threading.Lock, not asyncio.Lock: the embedded/TUI sync tool-call
         # path (DeerFlowClient.stream() -> LangGraph ToolNode._func -> a
         # ThreadPoolExecutor -> deerflow.tools.sync.make_sync_tool_wrapper's
@@ -39,32 +55,47 @@ class OAuthTokenManager:
         # either deadlocks silently or raises "bound to a different event loop".
         # threading.Lock has no loop affinity, so it is safe to share across
         # however many event loops/threads call into the same server's lock.
-        self._locks: dict[str, threading.Lock] = {name: threading.Lock() for name in oauth_by_server}
+        self._states = {name: _OAuthState(config=oauth.model_copy(deep=True)) for name, oauth in oauth_by_server.items()}
 
     @classmethod
-    def from_extensions_config(cls, extensions_config: ExtensionsConfig) -> OAuthTokenManager:
+    def from_extensions_config(
+        cls,
+        extensions_config: ExtensionsConfig,
+        *,
+        shared_manager: OAuthTokenManager | None = None,
+    ) -> OAuthTokenManager:
+        """Build a manager, optionally reusing already-validated connection state.
+
+        The durable runtime supplies ``shared_manager`` only after validating
+        the deployment snapshot. Personal connections must never use it.
+        """
         oauth_by_server: dict[str, McpOAuthConfig] = {}
         for server_name, server_config in extensions_config.get_enabled_mcp_servers().items():
             if server_config.oauth and server_config.oauth.enabled:
                 oauth_by_server[server_name] = server_config.oauth
-        return cls(oauth_by_server)
+        manager = cls(oauth_by_server)
+        if shared_manager is not None:
+            for name in manager._states.keys() & shared_manager._states.keys():
+                manager._states[name] = shared_manager._states[name]
+        return manager
 
     def has_oauth_servers(self) -> bool:
-        return bool(self._oauth_by_server)
+        return bool(self._states)
 
     def oauth_server_names(self) -> list[str]:
-        return list(self._oauth_by_server.keys())
+        return list(self._states)
 
     async def get_authorization_header(self, server_name: str) -> str | None:
-        oauth = self._oauth_by_server.get(server_name)
-        if not oauth:
+        state = self._states.get(server_name)
+        if state is None:
             return None
 
-        token = self._tokens.get(server_name)
+        oauth = state.config
+        token = state.token
         if token and not self._is_expiring(token, oauth):
-            return f"{token.token_type} {token.access_token}"
+            return self._authorization_value(token, server_name)
 
-        lock = self._locks[server_name]
+        lock = state.lock
         # Acquire the OS-level lock off-thread so a blocking wait never blocks this
         # event loop, then release it synchronously (release() never blocks). This
         # keeps the de-duplication behavior of the old `async with lock:` (only one
@@ -99,16 +130,46 @@ class OAuthTokenManager:
             lock.release()
             raise
         try:
-            token = self._tokens.get(server_name)
+            token = state.token
             if token and not self._is_expiring(token, oauth):
-                return f"{token.token_type} {token.access_token}"
+                return self._authorization_value(token, server_name)
 
             fresh = await self._fetch_token(oauth)
-            self._tokens[server_name] = fresh
+            state.token = fresh
             logger.info(f"Refreshed OAuth access token for MCP server: {server_name}")
-            return f"{fresh.token_type} {fresh.access_token}"
+            return self._authorization_value(fresh, server_name)
         finally:
             lock.release()
+
+    @staticmethod
+    def _authorization_value(token: _OAuthToken, server_name: str) -> str:
+        """Render the Authorization value, refusing one the transport would echo.
+
+        The token endpoint's response is not this process's to control: an
+        ``access_token`` or ``token_type`` carrying a newline reaches h11, which
+        raises with the full value in the message, and
+        ``ToolErrorHandlingMiddleware`` copies that message into a
+        model-visible ToolMessage. Failing closed here keeps the token out of
+        the prompt, the checkpoint, and traces, at the one boundary every caller
+        goes through -- the tool interceptor, the initial discovery headers, and
+        the durable task path all read their value from here. A token outside
+        ASCII fails earlier, inside httpx, with only the offending character in
+        the message; that one is refused for a deliverable error rather than for
+        secrecy.
+
+        The rendered value is what gets checked, not the two fields separately,
+        because the rendered value is what the transport sees. An
+        ``access_token`` of ``" abc"`` is legal once it sits after ``Bearer ``
+        even though the field on its own carries leading whitespace, and
+        rejecting it would deny a token the server would have accepted.
+        """
+        value = f"{token.token_type} {token.access_token}"
+        reason = illegal_header_value_reason(value)
+        if reason is not None:
+            # Names the server and the reason, never the token: this message
+            # travels to the model on the interceptor path.
+            raise ValueError(f"OAuth token for MCP server '{server_name}' cannot be sent as an HTTP header value: the Authorization value {reason}. Check what the token endpoint returned for this server.")
+        return value
 
     @staticmethod
     def _is_expiring(token: _OAuthToken, oauth: McpOAuthConfig) -> bool:
@@ -118,10 +179,13 @@ class OAuthTokenManager:
     async def _fetch_token(self, oauth: McpOAuthConfig) -> _OAuthToken:
         import httpx  # pyright: ignore[reportMissingImports]
 
-        data: dict[str, str] = {
-            "grant_type": oauth.grant_type,
-            **oauth.extra_token_params,
-        }
+        # extra_token_params is spread first so the reserved fields below
+        # (grant_type, scope, audience, client_id, ...) cannot be silently
+        # overridden by an operator-supplied key — otherwise the branch logic
+        # below (which keys off oauth.grant_type) and the value actually sent
+        # to the token endpoint would disagree.
+        data: dict[str, str] = dict(oauth.extra_token_params)
+        data["grant_type"] = oauth.grant_type
 
         if oauth.scope:
             data["scope"] = oauth.scope
@@ -154,8 +218,8 @@ class OAuthTokenManager:
             raise ValueError(f"OAuth token response missing '{oauth.token_field}'")
 
         # Persist a rotated refresh_token so subsequent refreshes use the latest
-        # value. This is an in-process update only — it is intentionally NOT
-        # written back to extensions_config.json. Providers that rotate refresh
+        # value. This updates our private runtime copy only — neither the parsed
+        # extensions config nor extensions_config.json. Providers that rotate refresh
         # tokens (Auth0, Okta, Google, etc.) return a new refresh_token on each
         # refresh; discarding it makes the next refresh fail with invalid_grant.
         if oauth.grant_type == "refresh_token":
@@ -165,42 +229,71 @@ class OAuthTokenManager:
 
         token_type = str(payload.get(oauth.token_type_field, oauth.default_token_type) or oauth.default_token_type)
 
-        expires_in_raw = payload.get(oauth.expires_in_field, 3600)
+        expires_in_raw = payload.get(oauth.expires_in_field, _DEFAULT_TOKEN_LIFETIME_SECONDS)
         try:
             expires_in = int(expires_in_raw)
-        except (TypeError, ValueError):
-            expires_in = 3600
-
-        expires_at = datetime.now(UTC) + timedelta(seconds=max(expires_in, 1))
+        except (TypeError, ValueError, OverflowError):
+            # ``OverflowError``: ``json.loads`` accepts ``Infinity``/``NaN``, and
+            # ``int()`` rejects a non-finite float. Treat it like any other
+            # unusable value instead of failing the whole token fetch.
+            expires_in = _DEFAULT_TOKEN_LIFETIME_SECONDS
+        now = datetime.now(UTC)
+        try:
+            expires_at = now + timedelta(seconds=max(expires_in, 1))
+        except OverflowError:
+            # Either timedelta construction or datetime addition can overflow.
+            # Let the arithmetic enforce its exact range, avoiding a rounded
+            # total_seconds() ceiling, and use the same instant for fallback.
+            expires_at = now + timedelta(seconds=_DEFAULT_TOKEN_LIFETIME_SECONDS)
         return _OAuthToken(access_token=access_token, token_type=token_type, expires_at=expires_at)
 
 
-def build_oauth_tool_interceptor(extensions_config: ExtensionsConfig) -> Any | None:
+def build_oauth_tool_interceptor(
+    extensions_config: ExtensionsConfig,
+    *,
+    token_manager: OAuthTokenManager | None = None,
+) -> Any | None:
     """Build a tool interceptor that injects OAuth Authorization headers."""
-    token_manager = OAuthTokenManager.from_extensions_config(extensions_config)
+    token_manager = token_manager or OAuthTokenManager.from_extensions_config(extensions_config)
     if not token_manager.has_oauth_servers():
         return None
+
+    # The servers' static header spellings, so the injected token replaces a
+    # static header spelled 'authorization' at the adapter's case-sensitive
+    # connection merge instead of riding alongside it (see ``mcp/headers.py``).
+    spellings_by_server = {server_name: header_spellings(server_config.headers) for server_name, server_config in extensions_config.get_enabled_mcp_servers().items()}
 
     async def oauth_interceptor(request: Any, handler: Any) -> Any:
         header = await token_manager.get_authorization_header(request.server_name)
         if not header:
             return await handler(request)
 
-        updated_headers = dict(request.headers or {})
-        updated_headers["Authorization"] = header
+        updated_headers = apply_header_overrides(
+            request.headers,
+            {"Authorization": header},
+            spellings=spellings_by_server.get(request.server_name),
+        )
         return await handler(request.override(headers=updated_headers))
 
     return oauth_interceptor
 
 
-async def get_initial_oauth_headers(extensions_config: ExtensionsConfig) -> dict[str, str]:
+async def get_initial_oauth_headers(
+    extensions_config: ExtensionsConfig,
+    *,
+    token_manager: OAuthTokenManager | None = None,
+    server_names: Collection[str] | None = None,
+) -> dict[str, str]:
     """Get initial OAuth Authorization headers for MCP server connections."""
-    token_manager = OAuthTokenManager.from_extensions_config(extensions_config)
+    token_manager = token_manager or OAuthTokenManager.from_extensions_config(extensions_config)
     if not token_manager.has_oauth_servers():
         return {}
 
     headers: dict[str, str] = {}
+    requested = set(server_names) if server_names is not None else None
     for server_name in token_manager.oauth_server_names():
+        if requested is not None and server_name not in requested:
+            continue
         try:
             value = await token_manager.get_authorization_header(server_name)
         except Exception:

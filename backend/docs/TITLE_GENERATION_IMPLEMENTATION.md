@@ -4,10 +4,10 @@
 
 ### 1. 核心实现文件
 
-#### [`src/agents/thread_state.py`](../src/agents/thread_state.py)
+#### [`packages/harness/deerflow/agents/thread_state.py`](../packages/harness/deerflow/agents/thread_state.py)
 - ✅ 添加 `title: str | None = None` 字段到 `ThreadState`
 
-#### [`src/config/title_config.py`](../src/config/title_config.py) (新建)
+#### [`packages/harness/deerflow/config/title_config.py`](../packages/harness/deerflow/config/title_config.py) (新建)
 - ✅ 创建 `TitleConfig` 配置类
 - ✅ 支持配置：enabled, max_words, max_chars, model_name, prompt_template
 - ✅ 提供 `get_title_config()` 和 `set_title_config()` 函数
@@ -20,11 +20,11 @@
 - ✅ 实现 `after_model()` / `aafter_model()` 钩子，在首次对话后自动触发
 - ✅ 包含 fallback 策略（LLM 未配置或失败时使用用户消息前几个字符）
 
-#### [`src/config/app_config.py`](../src/config/app_config.py)
+#### [`packages/harness/deerflow/config/app_config.py`](../packages/harness/deerflow/config/app_config.py)
 - ✅ 导入 `load_title_config_from_dict`
 - ✅ 在 `from_file()` 中加载 title 配置
 
-#### [`src/agents/lead_agent/agent.py`](../src/agents/lead_agent/agent.py)
+#### [`packages/harness/deerflow/agents/lead_agent/agent.py`](../packages/harness/deerflow/agents/lead_agent/agent.py)
 - ✅ 导入 `TitleMiddleware`
 - ✅ 注册到 `middleware` 列表：`[SandboxMiddleware(), TitleMiddleware()]`
 
@@ -42,7 +42,7 @@ title:
 
 ### 3. 文档
 
-#### [`docs/AUTO_TITLE_GENERATION.md`](../docs/AUTO_TITLE_GENERATION.md) (新建)
+#### [`docs/AUTO_TITLE_GENERATION.md`](AUTO_TITLE_GENERATION.md) (新建)
 - ✅ 完整的功能说明文档
 - ✅ 实现方式和架构设计
 - ✅ 配置说明
@@ -133,7 +133,7 @@ checkpointer = SqliteSaver.from_conn_string("deerflow.db")
 // langgraph.json
 {
   "graphs": {
-    "lead_agent": "src.agents:lead_agent"
+    "lead_agent": "deerflow.agents:lead_agent"
   },
   "checkpointer": "checkpointer:checkpointer"
 }
@@ -220,7 +220,7 @@ pytest
 
 ## 📚 相关资源
 
-- [完整文档](../docs/AUTO_TITLE_GENERATION.md)
+- [完整文档](AUTO_TITLE_GENERATION.md)
 - [LangGraph Middleware](https://langchain-ai.github.io/langgraph/concepts/middleware/)
 - [LangGraph State 管理](https://langchain-ai.github.io/langgraph/concepts/low_level/#state)
 - [LangGraph Checkpointer](https://langchain-ai.github.io/langgraph/concepts/persistence/)

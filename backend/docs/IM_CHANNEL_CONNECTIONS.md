@@ -1,6 +1,6 @@
 # IM Channel Connections
 
-DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, and WeCom. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
+DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, WeCom, QQ, and Buzz. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
 
 No public IP, OAuth callback URL, or provider webhook is required in this implementation.
 
@@ -15,6 +15,13 @@ A user-owned IM channel connection is a **per-DeerFlow-user bind layer** layered
 1. **Owner identity** — each `(provider, external account, workspace)` maps to exactly one DeerFlow account (`owner_user_id`). Every run created from that connection runs in the owner's bucket (memory, uploads, outputs, custom agent).
 2. **One-time bind codes** — the browser Connect flow mints a short-lived `secrets.token_urlsafe(16)` code (600 s TTL, single-use) and surfaces it only in the initiating user's browser. The platform worker consumes `/connect <code>` (Telegram uses `/start <code>` over a deep link) before applying any `allowed_users` filter, so a not-yet-allowlisted user can complete their first bind.
 3. **Strict ownership transfer** — the latest successful bind wins; `upsert_connection` revokes other owners' active rows for the same external identity. The DB-enforced partial unique index `uq_channel_connection_active_identity` (`WHERE status != 'revoked'`) makes the invariant race-free across concurrent writers.
+
+### Conversation-scoped Custom Agents
+
+Connected users can run `/agent list` to inspect the Custom Agents in their own DeerFlow user bucket, then `/agent use <name>` to start a new conversation with one.
+The selection is written to the new Gateway thread's channel metadata and, for a Custom Agent, to the canonical `agent_name` routing metadata used by the Web UI. It is cached by `ChannelManager` for subsequent turns; on restart, the manager reads the channel metadata before the first resumed turn. Opening that thread from Web search therefore continues under the same Custom Agent instead of falling back to the default runtime.
+Because selecting an agent always creates a new thread instead of mutating the current one, an existing conversation keeps its original runtime, prompt, skills, and checkpoint lineage.
+`/agent use lead_agent` starts a new conversation with the default agent.
 
 Connect codes are deliberately **bind-time defenses**, not chat-time defenses. After binding, ordinary `allowed_users` continue to gate regular messages exactly as before.
 
@@ -97,14 +104,14 @@ sequenceDiagram
     autonumber
     participant Platform as Provider<br/>(Slack/Telegram/...)
     participant Worker as Provider worker
-    participant Bus as MessageBus<br/>InboundMessage queue
-    participant Mgr as ChannelManager
+    participant Bus as MessageBus<br/>bounded admission + queue
+    participant Mgr as ChannelManager<br/>fixed worker pool
     participant Client as langgraph_sdk<br/>async client
     participant Gateway as Gateway<br/>/api/* routers
 
     Platform->>Worker: inbound chat message<br/>(resolved to connection_id + owner_user_id)
-    Worker->>Bus: publish_inbound(InboundMessage)
-    Bus->>Mgr: msg = get_inbound()
+    Worker->>Bus: reserve by Gateway handoff, then commit InboundMessage
+    Bus->>Mgr: fixed worker gets msg and awaits handler inline
     Mgr->>Mgr: _channel_storage_user_id(msg)<br/>→ owner-bound user_id
     Mgr->>Mgr: _get_bound_identity_rejection()<br/>(re-check identity by provider+ext+ws)
     Mgr->>Client: _get_or_create_thread(thread_id or new)
@@ -128,6 +135,18 @@ sequenceDiagram
     Bus->>Worker: outbound callback
     Worker->>Platform: post reply (Telegram editMessageText,<br/>Feishu patch card, etc.)
 ```
+
+### Inbound capacity and overload behavior
+
+Three top-level `channels` settings control the MessageBus/manager lifecycle: `inbound_queue_maxsize` (default `1000`) covers queued messages plus provider-side reservations that may still be doing final identity/ack preparation, `max_concurrency` (default `5`) is the exact number of long-lived `ChannelManager` workers, and `shutdown_grace_period_seconds` (default `3`) bounds graceful draining before active handlers are cancelled. Active handlers run inline in those workers, so a burst cannot create a task per message. The maximum manager-owned live intake is therefore the pending capacity plus the fixed worker count.
+
+Admission never waits for queue space, because waiting producer coroutines would simply move the unbounded backlog outside the queue. At capacity:
+
+- Slack, Discord, Feishu/Lark, DingTalk, Telegram, WeChat, and WeCom drop the new message before DeerFlow sends its working acknowledgment. `MessageBus` emits a rate-limited warning with a cumulative rejection count.
+- Buzz leaves the per-channel replay watermark unchanged and reconnects, allowing relay history to replay the event.
+- GitHub webhook fan-out returns `503`. GitHub records the delivery as failed; an operator or recovery job can retry it through the Recent Deliveries UI or REST redelivery API (GitHub does not retry failed deliveries automatically).
+
+Shutdown first closes admission and cancels follow-up watchers, but keeps provider transports alive while workers drain accepted messages for up to `shutdown_grace_period_seconds`. Once that grace expires, it cancels active handlers, discards queue entries that never began, and awaits every manager-owned worker and watcher. Provider coroutines submitted from SDK threads are likewise retained, cancelled, and awaited before their channel tears down SDK resources. A successful stop therefore leaves no owned handler able to use a closed transport. The Gateway's outer shutdown timeout remains the process-level bound; if it cancels cleanup, the service retains its transports and singleton instead of reporting a successful stop or hiding unfinished ownership.
 
 ## Sync vs Streaming Channels
 
@@ -208,7 +227,20 @@ The cached value is reused across the blocking (`runs.wait`) and streaming (`_ha
 
 ## IM File Attachment Pipeline
 
-Inbound files (images, documents) walk through `Channel.receive_file` for materialization, then `_ingest_inbound_files` for owner-bound staging. The agent sees the staged path via the `<uploaded_files>` block injected into its context.
+Inbound files (images, documents) first pass through `Channel.receive_file` for
+provider-specific materialization. Attachments that continue through the shared
+metadata path are staged by `_ingest_inbound_files`; their metadata is placed in
+`HumanMessage.additional_kwargs.files`, and `UploadsMiddleware` injects a
+`<current_uploads>` block for the current message. Some providers instead consume
+their descriptors while downloading and rewrite placeholders or message text with
+the resulting virtual path (or a failure notice). Historical uploads are not
+automatically injected on later turns; the agent discovers them with
+`list_uploaded_files`.
+
+Feishu/Lark inbound resource streams are read with a 20,000,000-byte cap before
+they are persisted or synced into a non-local sandbox. Oversized resources and
+per-file path failures are surfaced as a failure placeholder in the message text
+without aborting later attachments in the same inbound message.
 
 ```mermaid
 sequenceDiagram
@@ -218,17 +250,24 @@ sequenceDiagram
     participant Mgr as ChannelManager
     participant Ch as Channel impl<br/>.receive_file
     participant FS as Uploads directory<br/>users/OWNER/.../uploads/
+    participant MW as UploadsMiddleware
     participant Agent as Agent run
 
     IM->>Worker: message with file URL/bytes
     Worker->>Mgr: InboundMessage(files=[...], connection_id, owner_user_id)
     Mgr->>Mgr: storage_user_id = _channel_storage_user_id(msg)
     Mgr->>Ch: receive_file(msg, thread_id, user_id=storage_user_id)
-    Note over Ch: provider-specific download<br/>(WeCom: decrypt_file;<br/>WeChat: read_bytes; others: HTTP GET)
-    Ch->>FS: write_upload_file_no_symlink(<br/>uploads/OWNER/.../<br/>, safe_name, data)
-    Ch-->>Mgr: msg with text rewritten to include <uploaded_files>
-    Mgr->>Mgr: _ingest_inbound_files(<br/>thread_id, msg, user_id=storage_user_id)
-    Mgr->>Agent: HumanMessage with <uploaded_files> block<br/>(paths under /mnt/user-data/uploads/)
+    Note over Ch: provider-specific download/decrypt/read;<br/>may persist or hand bytes to manager
+    Ch-->>Mgr: materialized message<br/>(provider may rewrite placeholders/text)
+    alt attachment continues through shared metadata path
+        Mgr->>FS: _ingest_inbound_files(<br/>thread_id, msg, user_id=storage_user_id)
+        FS-->>Mgr: uploaded file metadata
+        Mgr->>MW: HumanMessage with<br/>additional_kwargs.files
+        MW->>Agent: prepend <current_uploads><br/>(paths under /mnt/user-data/uploads/)
+    else provider supplies virtual path in message text
+        Ch->>FS: persist and/or sync attachment
+        Mgr->>Agent: HumanMessage with rewritten path<br/>or failure notice
+    end
     Agent->>FS: read_file / view_image (sandbox)
 ```
 
@@ -247,6 +286,10 @@ Configure the actual IM bots under the existing `channels` block:
 
 ```yaml
 channels:
+  inbound_queue_maxsize: 1000
+  max_concurrency: 5
+  shutdown_grace_period_seconds: 3
+
   telegram:
     enabled: true
     bot_token: $TELEGRAM_BOT_TOKEN
@@ -278,6 +321,11 @@ channels:
     enabled: true
     bot_id: $WECOM_BOT_ID
     bot_secret: $WECOM_BOT_SECRET
+
+  buzz:
+    enabled: true
+    relay_url: wss://buzz.example.com
+    private_key: $BUZZ_PRIVATE_KEY   # hex or nsec1…
 ```
 
 Then enable user bindings in `channel_connections`:
@@ -311,6 +359,9 @@ channel_connections:
     enabled: true
 
   wecom:
+    enabled: true
+
+  buzz:
     enabled: true
 ```
 
@@ -346,6 +397,209 @@ Feishu/Lark, DingTalk, WeChat, and WeCom:
 - The UI shows `Send /connect <code> to the DeerFlow <Provider> bot.`
 - The already-running long-connection or polling worker receives the message and binds the platform user/workspace identity to the current DeerFlow user.
 
+Buzz:
+
+- Unlike the bot/app credentials above, Buzz has no separate developer console: DeerFlow joins the relay as an ordinary member identity. Generate a Nostr keypair for that identity — everything below refers to its **hex public key**.
+- **Onboarding takes two separate steps, and both are required.** Relay membership and channel membership are different things, and doing only the first produces a connector that connects and authenticates cleanly while receiving nothing:
+
+  1. **Register the pubkey as a relay member** — `buzz-admin add-member --pubkey <hex>`. This is what lets the identity authenticate (NIP-42) and publish at all.
+  2. **Add it to each channel it should participate in** — `buzz channels add-member --channel <uuid> --pubkey <hex> --role bot`. Chat events are only delivered to a channel's members, and the relay additionally **rejects** any message that `p`-mentions a non-member with `mentioned pubkeys are not channel members` — so without this step the connector can neither hear a mention nor answer one.
+
+  See the [Buzz project](https://github.com/block/buzz) for the admin tooling.
+- **Channels are auto-discovered — you do not list them in `config.yaml`.** On every connection the connector asks the relay which channels this identity belongs to and subscribes to each one individually. Adding it to a new channel later takes effect **live**, without a restart or reconnect: the relay sends a membership notification and the connector starts listening immediately (and stops listening when it is removed). If you see `channel discovery returned no channels` in the logs, step 2 above has not been done.
+- Configure `relay_url` and `private_key` (hex or `nsec1…`) under `channels.buzz`, then enable `channel_connections.buzz`.
+- The frontend creates a short one-time code.
+- The UI shows `Send /connect <code> to the DeerFlow Buzz bot.`
+- The already-running Buzz relay-loop worker receives the message — sent as a DM or an @mention in a channel both parties belong to — and binds the sender's Nostr pubkey to the current DeerFlow user.
+- Requires the `buzz` dependency extra (`uv sync --extra buzz`) for the `coincurve` library. `scripts/detect_uv_extras.py` (and Docker/production builds via `backend/Dockerfile`) auto-detect and preserve this extra when `channels.buzz.enabled: true` in `config.yaml`, the same way the `browser` extra is auto-detected for `browser_navigate`.
+
+### Buzz subscription model
+
+Buzz's relay only delivers chat events to **channel-scoped** subscriptions, which is why the connector's subscriptions look the way they do. A global `REQ {"kinds":[9]}` is accepted and answered with `EOSE`, but no chat event is ever fanned out to it, and a single subscription cannot cover several channels either (a multi-value `#h` matches nothing). So, on **every** connection, after NIP-42 auth completes:
+
+| Subscription | Filter | Purpose |
+|---|---|---|
+| `buzz-discovery` | `{"kinds":[39000]}` | Historical query listing exactly the channels this identity is a member of (one stored event each, then `EOSE`). Supplies each channel's name and type, which is also what the DM mention-exemption reads. Do **not** narrow it with `#p` — that matches nothing. |
+| `buzz-membership` | `{"kinds":[44100,44101], "#p":["<our pubkey>"], "since": …}` | **Live** membership notifications. `44100` (added) subscribes to the new channel immediately; `44101` (removed) closes that channel's live and backlog subscriptions and clears its paging state. This is what makes a newly added channel work without a restart. |
+| `buzz-chat-<uuid>` | `{"kinds":[9], "#h":["<uuid>"], "since": …}` | One per discovered channel — the only shape that actually receives messages. |
+
+Consequences worth knowing operationally:
+
+- **Replay is tracked per channel.** Each channel carries its own `since` watermark, advanced only by events DeerFlow actually processed. A single shared watermark would let a busy channel drag the cursor past a quiet channel's unread messages and skip them after a reconnect; per-channel cursors can only ever cost duplicate delivery (which the manager's inbound dedupe absorbs), never a miss.
+- **Membership is scoped to live events.** The relay *stores* 44100/44101 events, so without a `since` every connection replayed the whole membership history as if it had just happened — re-running channel discovery once per stored add (you would see several `channel discovery complete` lines for one connect, and channels logged as `<unnamed>`), re-subscribing channels you have since been removed from, and briefly unsubscribing channels you are still in. The subscription is therefore anchored at the moment the socket opened, minus 60s of slack so a membership change made *during* the connect/auth handshake — or a small relay clock skew — is still picked up.
+- **The number of channel subscriptions is capped** (256). The channel list comes off the wire, so it is bounded like any other remote-fed state. At the cap, new channels are refused and named in a `per-channel subscription limit reached` warning rather than an existing, working subscription being evicted.
+- **A subscription the relay closes is re-opened, up to 3 times per connection.** Every subscription on the socket fails *silently* when the relay drops it: a chat subscription deafens one channel, `buzz-membership` stops DeerFlow ever learning it was added to or removed from a channel, `buzz-discovery` kills the completeness sweep. So a `CLOSED` frame is recovered, not just noted, and the subscription that went quiet is always named at WARNING level. Recovery is skipped when the relay's stated reason says the subscription is not ours any more — a NIP-01/NIP-42 `auth-required:` / `restricted:` / `blocked:` / `invalid:` prefix, or buzz-relay's own revocation wording — because re-issuing the same REQ then just fights the relay. Any other reason (including a `CLOSED` with no reason at all) is treated as a hiccup and retried, with the 3-attempt budget as the backstop; after that it stays down until the next reconnect, which rebuilds everything from scratch.
+- **A backlog larger than the relay's 2000-per-subscription cap is now paged, not lost.** The relay serves at most 2000 stored events per subscription, newest-first, even with a `since`. When a channel's history page comes back *at* that cap, DeerFlow walks the history backwards with further `until`-bounded queries on a separate subscription until a page comes back under the cap or it reaches the point it had already read, so the oldest unread messages are fetched rather than skipped. The walk needs a read watermark to stop at, so it runs only for a channel DeerFlow has already read from; a channel's *first* connect (and any channel whose cursor was evicted) keeps the previous newest-2000 behaviour rather than paging back with nothing to reach. The walk is best-effort and additive. It stops with a warning at 50 pages or when a saturated page makes no timestamp progress. A full page of events at the inclusive `until` boundary cannot be advanced safely using timestamps alone: subtracting a second could skip unread events with that timestamp, so DeerFlow stops instead of repeatedly fetching the same page. Remaining history may be unfetched. Membership removal or a closed live subscription closes any open backlog page and clears its state; late backlog frames are ignored.
+
+### Buzz trust model
+
+On a team-run Buzz relay the relay operator is not necessarily the DeerFlow operator, so be precise about what the connector proves and what it takes on trust:
+
+**Verified (cryptographically, on every inbound event):** DeerFlow recomputes each event's NIP-01 id from the delivered payload and verifies its BIP-340 Schnorr signature against the claimed `pubkey` before the event can influence anything. A relay therefore cannot rewrite a member's message, replay one author's signature onto another payload, or claim an allowlisted author it does not hold the key for. This applies to `/connect` binds as well as ordinary chat, so a relay cannot bind someone else's pubkey to an attacker's DeerFlow account. Events that fail verification are dropped with a warning.
+
+**Trusted (not verified):** the *authorship* of kind-39000 channel metadata. Buzz publishes channel discovery events from the relay's own keypair, but nothing already configured identifies that key (`relay_url` is a network address, not a signing key), so DeerFlow only proves such an event was signed by *some* member. Because channel discovery and subscription are now driven by exactly these events, a forged kind-39000 has two effects, not one:
+
+1. It can mark a channel `type: "dm"`, which relaxes the `require_mention` requirement for that channel.
+2. It can make DeerFlow **open a chat subscription** for a channel of the forger's choosing, since the set of channels DeerFlow listens to is the set it holds metadata for.
+
+Neither can make anything be *acted on*. The `allowed_users` allowlist and per-event signature verification are independent gates: an author who is not allowlisted is dropped regardless of channel type or how the subscription was opened. The blast radius of (2) is a relay reading its own traffic back to a subscriber that ignores it, bounded by the 256-subscription cap (which refuses new subscriptions rather than evicting working ones, so an induced subscription cannot displace a real channel). The same applies to a forged kind-44100 membership notification, except that its `p` tag is re-checked locally, so it must at least name this identity. If you need the mention requirement to be unforgeable on a relay whose members you do not all trust, keep those channels out of `mention_free_channels` and treat DM detection as convenience rather than a boundary.
+
+**Deny-by-default allowlist:** unlike other providers (where an empty `allowed_users` means "allow everyone"), `channels.buzz.allowed_users` is deliberately deny-by-default — an empty list means *nobody* can trigger a run, and DeerFlow logs a startup warning saying so. Add each member pubkey (hex or `npub1…`) that should be able to reach the agent. Individual drops are logged at DEBUG level.
+
+**Bound identity:** once a pubkey completes `/connect`, its inbound messages resolve to that connection and run under the bound DeerFlow user (memory, files, and artifacts land in that user's buckets). Bindings are scoped to the relay host, so the same pubkey on a different relay is a different identity and must bind separately.
+
+### Feishu scheduled-task notifications
+
+Feishu/Lark sends scheduled-task result and lifecycle notices as static Markdown
+cards to the task owner's currently bound user. The existing notification outbox
+provides retry, localization, redaction and send-time binding checks; Settings
+reports this through `proactive_notifications`. Manual trial runs stay silent.
+
+The configured app needs bot messaging permission (`im:message:send_as_bot`, or
+its broader `im:message` alternative), and the recipient must be in its available
+scope. Complete `/connect <code>` in a private chat with the same app. The outbox
+keeps the application-scoped `open_id` as its identity; delivery prefers that
+owner's currently connected, explicitly recorded private-chat address. Group
+chats are never used for these personal notices. Older bindings without recorded
+chat type keep the `open_id` path; if Feishu rejects it with `230101`, bind again
+in private chat. Changing the app also requires rebinding.
+The existing WebSocket channel must be running; sends use the configured SDK's
+REST client, so no public callback or interactive-card subscription is needed.
+
+For provider-backed acceptance, bind a test user, let a once task run on its
+schedule, and confirm the notice arrives without another chat message. Check
+that a platform rejection is recorded as a failed delivery and that unbinding
+prevents later sends. API acceptance is not a read receipt. The shared outbox
+can retry an ambiguously acknowledged send; it does not promise exactly-once
+messages at the provider. Record whether domestic Feishu or international Lark
+was actually exercised.
+
+### Group notifications
+
+Tasks may explicitly select one additional connected Feishu, QQ or WeCom group. Personal
+notifications keep their existing recipients. The task stores the chosen
+`notification_group_connection_id`; a group notice stores that connection ID as
+its outbox target with `payload.target_type="group"`. It never infers a group
+destination from all of the owner's bindings.
+
+In the task form select the supported channel's group-binding button. For QQ
+and WeCom, enter a recognizable group name before generating the code; the
+browser sends optional `group_name` to `POST /api/channels/{provider}/connect`,
+which stores the name with the single-use OAuth state. Send the unchanged
+`/connect` command in that group, then refresh and select the saved name.
+Bindings for two groups remain distinct from each other and from private chats.
+Feishu can retrieve its group name using `im:chat:read`; grant that permission
+and publish the app changes. A failed lookup does not discard the binding,
+but unnamed groups cannot be newly selected: fix the permission or name and
+bind again. API selection and each delivery verify the
+task owner, connection ID, connected status, and recorded group/chat identity.
+The adapter resolves its verified group identity; a lost binding cannot fall back
+to another group or a private chat. A bot removed from the group produces a
+normal platform rejection handled by the existing retry budget.
+
+Omitting the field in PATCH preserves it; `null` clears it. Destination-only
+edits do not re-arm completed tasks or change the run budget. The destination
+is fixed when each notification is enqueued; later task edits affect future
+notices, and unbinding still blocks pending ones. Migration `0040` adds a nullable
+reference with no backfill. Upgrade Gateway workers and the frontend together;
+the form uses `/api/features.scheduled_tasks.group_notifications` to hide new
+selection on older Gateways. The conversation scheduling tool does not set
+group targets in this version.
+
+Real-provider acceptance should confirm that a selected task appears in the
+specified group, an unselected task remains private, and removing the bot or
+revoking its binding prevents a successful group send. Record the account and
+tenant setup actually used; the outbox remains at-least-once.
+
+### QQ WebSocket setup (MVP)
+
+QQ uses an outbound WebSocket connection for events and the QQ Open Platform
+HTTPS API for replies. No public server, webhook route, callback URL, or tunnel
+is required. This transport requires a bot whose developer console offers
+WebSocket access; availability should be checked for your bot.
+
+1. Create a bot in the QQ Open Platform console and select **WebSocket** under
+   development settings. Enable the private-message and group @mention
+   capabilities you intend to use. Configure permitted test accounts/groups in
+   the console when the bot is in testing; publishing and platform approval
+   requirements are separate from DeerFlow configuration.
+2. Supply `QQ_APP_ID` and `QQ_CLIENT_SECRET` to the Gateway process, or save the
+   App ID and Client secret through the administrator's Channels UI. Do not
+   commit credentials. A frontend `.env.local` file is not a substitute for
+   supplying the Gateway's environment.
+3. Configure the transport and, for authenticated users, the binding UI:
+
+```yaml
+channels:
+  qq:
+    enabled: true
+    app_id: $QQ_APP_ID
+    client_secret: $QQ_CLIENT_SECRET
+    allowed_users: []
+    sandbox: false
+
+channel_connections:
+  enabled: true
+  require_bound_identity: true
+  qq:
+    enabled: true
+```
+
+4. Restart the Gateway after editing YAML. In **Settings > Channels > QQ**, get
+   a one-time binding code and send `/connect <code>` to the bot. For a group
+   binding, @mention the bot before the command in that group. Then send a
+   private text message, or @mention the bot with text in the bound group.
+
+`allowed_users` contains QQ OpenIDs, not numeric QQ account numbers. An empty
+list admits ordinary messages from all senders, subject to the shared bound
+identity policy. As with other channels, a valid binding code is consumed
+before this allowlist. Treat the code as confidential; only bind in trusted
+groups. Private identities are scoped to the bot App ID; group identities are
+scoped to both the App ID and group OpenID. Do not assume private and group
+OpenIDs represent the same identity. Bind each context separately. Group
+conversation histories are isolated by sender, but replies remain visible to
+everyone in the group.
+
+List several OpenIDs as a YAML list. A single OpenID, such as an
+`allowed_users: $QQ_ALLOWED_USERS` reference, is one entry rather than a
+sequence of characters. An unset or null value, an empty list, and a blank or
+whitespace-only string such as `" "` all allow every sender; they do not
+restrict access. Entries that are not OpenID strings, such as numeric
+QQ account numbers, are ignored with a warning, and a mapping is rejected as a
+whole, so none of its keys is authorized. A configured value with no valid
+OpenID denies every sender and logs an error.
+
+The MVP supports text-only `C2C_MESSAGE_CREATE` and `GROUP_AT_MESSAGE_CREATE`
+events and final text replies. It does not download/upload attachments, stream
+partial answers or handle guild/channel messages. Scheduled private results
+use the separate proactive notification path described below. Replies require the original message ID: C2C replies have a 60-minute
+window with at most four replies per source message; group replies have a
+5-minute window with at most five replies. Long answers are split at UTF-8 character boundaries with a
+conservative 4,000-byte adapter budget per message; overflow is marked as
+truncated in the last permitted reply. Unknown or timezone-naive message
+timestamps use the full advisory window and emit a rate-limited warning without
+message content; QQ still enforces reply expiry server-side.
+Runs that finish after the platform's reply window remain available
+in DeerFlow but cannot be delivered through that source message. QQ may reject
+links that are not approved in the bot's URL allowlist.
+
+Use one active Gateway channel worker per bot for this MVP. Token refresh,
+heartbeat monitoring, reconnect backoff, and session Resume are automatic.
+Invalid sessions/sequence numbers trigger a fresh Identify. Bindings persist;
+session state, duplicate suppression and passive-reply contexts are bounded
+in-memory state and do not survive a process restart. The `sandbox` option
+changes only the REST API host; test-account/group membership is controlled
+separately in the QQ console.
+
+For an opt-in transport check, supply the two QQ credential environment
+variables, set `DEER_FLOW_RUN_LIVE_TESTS=1`, and run
+`uv run pytest -m live tests/test_qq_channel_live.py` from `backend/`.
+It checks READY, two heartbeat acknowledgements and shutdown; it does not send
+chat messages or establish end-to-end agent or group-message compatibility.
+
+Protocol references: [QQ event subscriptions](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)
+and [message sending rules](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/send-receive/send.html).
+
 Codes use 128 bits of randomness, expire after 10 minutes, and are single-use.
 
 For providers with an `allowed_users` allowlist (Telegram, Slack, DingTalk, WeChat, …), a valid `/connect <code>` (or Telegram `/start <code>`) is consumed **before** the allowlist is checked. This is intentional: a user who is not yet on the allowlist — and whose platform identity the bot has therefore never seen — can still complete their first browser-initiated bind. After binding, `allowed_users` continues to gate ordinary (non-bind) messages as before.
@@ -357,7 +611,7 @@ Connection records live in SQL tables under `deerflow.persistence.channel_connec
 - `channel_connections`: owner user, provider identity, workspace/guild/team, status, metadata.
 - `channel_oauth_states`: one-time connect codes and Telegram deep-link state.
 - `channel_conversations`: connection-scoped IM conversation to DeerFlow thread mapping.
-- `channel_credentials`: reserved for future provider-token flows, not used by the local/private binding flow.
+- `channel_credentials`: per-connection provider tokens for future provider-token flows, encrypted with `DEER_FLOW_CREDENTIALS_KEY` (see [CONFIGURATION.md](CONFIGURATION.md#credentials-encryption-key-deer_flow_credentials_key)); not written by the local/private binding flow.
 
 Incoming messages that resolve to a connection carry `connection_id`, `owner_user_id`, and `workspace_id`. `ChannelManager` uses `owner_user_id` as the DeerFlow run user id and preserves the raw platform user id as `channel_user_id`.
 
@@ -367,9 +621,31 @@ from the browser runtime setup flow, which persists them through
 `ChannelRuntimeConfigStore` so local/private deployments can configure bots
 without editing YAML. The runtime store is a local plaintext JSON fallback with
 owner-only file permissions (`0600`); use it only where the DeerFlow data
-directory is already trusted as secret storage. WeChat QR login auth state
+directory is already trusted as secret storage. Every Gateway worker keeps its own copy
+of the file; a save or disconnect rereads it under an advisory sidecar lock
+(`.runtime-config.json.lock`) and changes only that provider, so workers sharing
+`DEER_FLOW_HOME` do not overwrite each other's bots. Reads still serve the copy
+the worker last loaded or wrote. WeChat QR login auth state
 follows the same local-runtime model and may persist a QR-derived bot token in
 the channel state directory.
+
+With several Gateway instances, `channels.leader_lease` gives each provider's
+platform connection to one instance: the holder of the provider's row in
+`channel_leases`. Bindings, connect codes and conversations are shared SQL
+state, so the connect flow works on any instance; `GET /api/channels/` names
+each provider's `leader`. Runtime credentials saved on an instance that does
+not hold the provider apply on the holder only when it next starts the
+channel. Channel runs are created with `on_disconnect: continue`, so a run
+keeps executing when the request that created it dies with its instance (a
+leader hand-off, a rolling restart, a crash): its thread state is persisted
+and the answer stays readable in the web UI, while the IM reply itself is
+lost with the old holder's transport state. Because that run survives, the
+manager keeps the inbound dedupe key once a run request has left it (a
+cancelled worker, a read timeout, a dropped connection), so the provider's
+redelivery of the same message on the new holder is dropped instead of
+executing the turn twice; a request the Gateway rejected, or a failure before
+the request was sent, still releases the key for a retry. See
+[IM channel leader lease](CONFIGURATION.md#im-channel-leader-lease-channelsleader_lease).
 
 ## Security Notes
 
@@ -379,8 +655,11 @@ the channel state directory.
   responses mask password fields, and mutating runtime/channel-worker APIs
   require an admin user.
 - Stored per-connection credentials use the `channel_credentials` encryption
-  path. If stored credential material cannot be decrypted, DeerFlow treats it
-  as unavailable instead of using corrupt secrets.
+  path, keyed by `DEER_FLOW_CREDENTIALS_KEY` (or the generated
+  `{DEER_FLOW_HOME}/.credentials_key` on a single instance). If stored
+  credential material cannot be decrypted — a lost or changed key — DeerFlow
+  treats it as unavailable instead of using corrupt secrets. A declared
+  multi-instance deployment with channel connections enabled must set the key.
 - The local plaintext runtime credential fallback is documented above; prefer
   deployment-managed environment/config secrets for non-local deployments until
   a dedicated secret backend is configured.
@@ -389,3 +668,70 @@ the channel state directory.
 - Provider bot tokens remain in `channels.*` and are never returned to the browser.
 - Stored per-connection credentials are encrypted. If stored credential material cannot be decrypted, DeerFlow treats it as unavailable instead of using corrupt secrets.
 - This implementation does not add public provider callback or webhook routes.
+
+## Proactive notification settings
+
+The shared outbox sends scheduled result/lifecycle notices to bound private
+identities on WeCom, Feishu/Lark, WeChat and QQ. **Settings → Notifications → IM
+notifications** lists connected, push-capable apps with the same per-provider
+control. The setting is durable and owner-scoped, and also works in local
+`DEER_FLOW_AUTH_DISABLED=1` mode. It does not disable chatting, disconnect an
+account or stop a scheduled task. Browser notifications have a separate switch.
+
+Opting out stops new enqueueing and permanently closes pending/retrying notices
+for that owner/provider, including any selected group. Re-enabling does
+not replay these notices. A platform send already in progress may still arrive.
+Preference lookup failures park instead of sending; ordinary binding revocation,
+localized summaries, redaction, deduplication and retry budgets remain shared.
+Upgrade every Gateway worker before relying on an opt-out during a rolling
+upgrade. Downgrading below `0041_im_notice_preferences` removes the choices.
+
+The same settings page has three default-off ordinary task/goal event controls:
+completion, terminal failure and requests for input. These use the same outbox,
+ownership checks, localized renderer and send/retry opt-out. An unanswered
+Human Input Card takes precedence over completion and is rechecked before
+sending; an answered or superseded request is dropped. Ordinary goal stand-downs,
+recoverable tool errors and interrupted runs do not become failure or input
+notices. IM-originated runs retain their normal conversation replies. Migration
+`0043_runtime_im_notices` adds real source identities for non-scheduled notices;
+downgrading that revision deletes the runtime notices and retains scheduled ones.
+
+WeCom groups bound before group destinations were introduced keep their legacy
+chat identity. That compatibility applies only to the old group-binding shape;
+a new private binding never authorizes messages from an unbound group. Bind a
+specific group again with a name to make it available as a notification target.
+
+### WeChat private notifications
+
+Use the existing iLink QR/bot setup and bind in a private chat. Send one private
+message so the worker can securely save the current conversation context. New
+contexts live in encrypted connection credentials and survive restart; private
+context tokens are not exposed by the browser connection API. Old bindings do
+not automatically trust a token previously stored in public metadata, and a
+changed bot token needs a fresh private message. Missing context or a platform
+rejection fails visibly rather than being recorded as sent. A server-expired
+context may need another private message. Notifications use the existing
+`sendmessage` HTTP path and require its success ACK, without a provider-local
+retry loop. WeChat group notification targets are not part of this version.
+
+Official protocol: [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol.md).
+The client-side protocol does not guarantee that the server accepts missing or
+arbitrarily old conversation contexts; real account acceptance is still required.
+
+### QQ private notifications
+
+Configure the existing QQ WebSocket bot and `/connect` in **private/C2C chat**.
+Group member OpenIDs are a different recipient namespace; a group-only binding
+is not used as a private notification destination. A proactive notice uses
+`POST /v2/users/{user_openid}/messages`, without `msg_id`, `event_id`, passive reply
+sequence/quota or `is_wakeup`. The recipient must permit proactive messages and
+the bot must have platform access. Success requires a nonempty message ID ACK.
+Transport failures park; platform rejections use the shared retry budget.
+
+Current official rules are in the [QQ message overview](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html).
+Older GitHub bot-docs snapshots say proactive sending was discontinued; use the
+current live documentation and verify the actual bot account. QQ group notices
+use the selected connection's current-App `group_openid`, not a member OpenID
+or the passive reply context. WeCom group notices use the selected current-bot
+`chatid` through the same smart-bot WebSocket sender; neither path falls back to
+a private destination when a group binding is unavailable.

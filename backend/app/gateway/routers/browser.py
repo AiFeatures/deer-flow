@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -6,10 +7,12 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from app.gateway.authz import require_permission
+from app.gateway.authz import Permissions, require_permission, resolve_route_permissions
 from app.gateway.browser_capability import browser_capability
 from deerflow.config.paths import get_paths
 from deerflow.runtime.user_context import get_effective_user_id, reset_current_user, set_current_user
+from deerflow.utils.file_io import await_drained
+from deerflow.utils.thread_id import ThreadId
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +79,7 @@ async def _browser_thread_owned_by(thread_store, thread_id: str, user_id: str) -
     description="Steer the thread's live browser session to a URL from the UI and capture a screenshot.",
 )
 @require_permission("threads", "write", owner_check=True, require_existing=True)
-async def navigate_browser(thread_id: str, body: BrowserNavigateRequest, request: Request) -> BrowserNavigateResponse:
+async def navigate_browser(thread_id: ThreadId, body: BrowserNavigateRequest, request: Request) -> BrowserNavigateResponse:
     user_id = str(request.state.auth.user.id)
     thread_store = getattr(request.app.state, "thread_store", None)
     if thread_store is None or not await _browser_thread_owned_by(thread_store, thread_id, user_id):
@@ -130,8 +133,15 @@ async def _authenticate_ws(websocket: WebSocket):
         if not isinstance(payload, TokenError):
             provider = get_local_provider()
             user = await provider.get_user(payload.sub)
-            if user is not None and user.token_version == payload.ver:
-                return user
+            if user is not None:
+                # Same post-lookup verdicts as every other JWT surface —
+                # including account suspension: WebSockets bypass
+                # AuthMiddleware, so a disabled user's still-valid cookie
+                # must not open a streaming/browser session.
+                from app.gateway.deps import validate_resolved_session_user
+
+                if validate_resolved_session_user(user, payload) is None:
+                    return user
     if is_auth_disabled():
         return get_auth_disabled_user()
     return None
@@ -175,13 +185,40 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
     return False
 
 
+async def _send_browser_frame(websocket: WebSocket, data: bytes, *, binary: bool) -> None:
+    if binary:
+        await websocket.send_bytes(data)
+        return
+    payload = {"type": "frame", "data": base64.b64encode(data).decode("ascii")}
+    await websocket.send_text(json.dumps(payload))
+
+
+async def _negotiate_browser_frame_format(websocket: WebSocket) -> bool | None:
+    """Accept the socket and resolve the optional frame transport capability."""
+    requested_format = websocket.query_params.get("frame_format")
+    await websocket.accept()
+    if requested_format not in {None, "binary"}:
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": f"Unsupported frame_format: {requested_format}",
+                },
+            ),
+        )
+        await websocket.close(code=1008)
+        return None
+    return requested_format == "binary"
+
+
 @router.websocket("/threads/{thread_id}/browser/stream")
-async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
+async def browser_stream(websocket: WebSocket, thread_id: ThreadId) -> None:
     """Bidirectional live browser stream.
 
-    Server → client: JSON ``{"type":"frame","data":"<base64 jpeg>"}`` frames
-    captured via CDP screencast. Client → server: input events (click, move,
-    down, up, wheel, key, text, navigate) that drive the live page.
+    Server → client: binary JPEG frames when ``frame_format=binary`` is
+    requested; legacy clients retain JSON base64 frames. Status and navigation
+    metadata remain JSON. Client → server: input events (click, move, down, up,
+    wheel, key, text, navigate) that drive the live page.
     """
     user = await _authenticate_ws(websocket)
     if user is None:
@@ -190,6 +227,21 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
 
     if not _ws_origin_allowed(websocket):
         # Cross-origin upgrade — reject before touching any session (WS-CSRF).
+        await websocket.close(code=4403)
+        return
+
+    # HTTP auth middleware does not run for WebSockets. Live is bidirectional,
+    # so even a viewer must have the same write permission as REST navigation.
+    # _authenticate_ws accepts session cookies or the auth-disabled user, not
+    # internal-auth tokens. Both sources are non-internal, including the
+    # synthetic admin used when authentication is disabled.
+    try:
+        permissions = await resolve_route_permissions(user, is_internal=False)
+    except Exception:
+        logger.warning("Failed to resolve browser stream permissions", exc_info=True)
+        await websocket.close(code=4501)
+        return
+    if Permissions.THREADS_WRITE not in permissions:
         await websocket.close(code=4403)
         return
 
@@ -217,17 +269,20 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
             BrowserLiveViewerError,
             BrowserSessionCapacityError,
             get_browser_session_manager,
+            resolve_browser_egress,
             validate_browser_url,
         )
     except ImportError:
         await websocket.close(code=4501)
         return
 
-    await websocket.accept()
+    use_binary_frames = await _negotiate_browser_frame_format(websocket)
+    if use_binary_frames is None:
+        return
 
     token = set_current_user(user)
     loop = asyncio.get_running_loop()
-    frame_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=4)
+    frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
     send_lock = asyncio.Lock()
     input_event = asyncio.Event()
     input_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=64)
@@ -238,7 +293,7 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
         async with send_lock:
             await websocket.send_text(json.dumps(payload))
 
-    def _on_frame(data: str) -> None:
+    def _on_frame(data: bytes) -> None:
         # Invoked on the private Playwright loop; hop to this loop and drop the
         # oldest frame when the client can't keep up (screencast is lossy).
         def _enqueue() -> None:
@@ -280,6 +335,7 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
             cdp_url=_cfg_str("cdp_url"),
             allow_unguarded_cdp=_cfg_bool("allow_unguarded_cdp", False),
             url_guard=validate_browser_url,
+            egress_resolver=resolve_browser_egress,
         )
         session = session_lease.__enter__()
     except BrowserSessionCapacityError:
@@ -294,7 +350,8 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
     async def _pump_frames() -> None:
         while True:
             data = await frame_queue.get()
-            await _send_payload({"type": "frame", "data": data})
+            async with send_lock:
+                await _send_browser_frame(websocket, data, binary=use_binary_frames)
 
     async def _send_url() -> None:
         # Report the page's real URL so the client's address bar reflects the
@@ -409,7 +466,7 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
                     # SSRF-screen client-driven navigations with the same policy
                     # the agent tools enforce; reject rather than dispatch.
                     url = event.get("url")
-                    reason = validate_browser_url(url) if isinstance(url, str) else "Error: invalid navigation URL"
+                    reason = await asyncio.to_thread(validate_browser_url, url) if isinstance(url, str) else "Error: invalid navigation URL"
                     if reason is not None:
                         await _send_payload({"type": "nav_rejected", "url": url, "message": reason})
                         continue
@@ -427,13 +484,14 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
     input_task: asyncio.Task | None = None
     reader_task: asyncio.Task | None = None
     poll_task: asyncio.Task | None = None
+    cancellation: asyncio.CancelledError | None = None
     try:
         # Seed the live page from the latest browser_view URL. A thread can have
         # a stale browser session from an earlier panel/live attempt; if that
         # page differs from the latest visible browser artifact, align Live with
         # what the user expects instead of requiring an off/on reconnect.
         seed = websocket.query_params.get("seed")
-        if seed and validate_browser_url(seed) is None:
+        if seed and await asyncio.to_thread(validate_browser_url, seed) is None:
             with contextlib.suppress(Exception):
                 current = await session.current_url()
                 if _should_apply_browser_seed(current, seed):
@@ -451,6 +509,8 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
         await reader_task
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError as exc:
+        cancellation = exc
     except Exception as exc:
         logger.exception("browser stream error: thread_id=%s err=%s", thread_id, exc)
     finally:
@@ -461,7 +521,14 @@ async def browser_stream(websocket: WebSocket, thread_id: str) -> None:
             reader_task.cancel()
         if poll_task is not None:
             poll_task.cancel()
-        with contextlib.suppress(Exception):
-            await session.stop_screencast(_on_frame)
+        try:
+            await await_drained(session.stop_screencast(_on_frame))
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            pass
         session_lease.__exit__(None, None, None)
         reset_current_user(token)
+        if cancellation is not None:
+            raise cancellation

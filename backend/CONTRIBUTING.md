@@ -165,8 +165,8 @@ feat: add support for Claude 3.5 model
 - Update model factory to handle Claude-specific settings
 - Add tests for new model
 ```
-
 Prefix types:
+
 - `feat:` - New feature
 - `fix:` - Bug fix
 - `docs:` - Documentation
@@ -200,7 +200,7 @@ Example test:
 
 ```python
 import pytest
-from src.models.factory import create_chat_model
+from deerflow.models.factory import create_chat_model
 
 def test_create_chat_model_with_valid_name():
     """Test that a valid model name creates a model instance."""
@@ -242,10 +242,10 @@ Include in your PR description:
 
 ### Adding New Tools
 
-1. Create tool in `src/tools/builtins/` or `src/community/`:
+1. Create tool in `packages/harness/deerflow/tools/builtins/` or `packages/harness/deerflow/community/`:
 
 ```python
-# src/tools/builtins/my_tool.py
+# packages/harness/deerflow/tools/builtins/my_tool.py
 from langchain_core.tools import tool
 
 @tool
@@ -267,45 +267,86 @@ def my_tool(param: str) -> str:
 tools:
   - name: my_tool
     group: my_group
-    use: src.tools.builtins.my_tool:my_tool
+    use: deerflow.tools.builtins.my_tool:my_tool
 ```
 
 ### Adding New Middleware
 
-1. Create middleware in `src/agents/middlewares/`:
+1. Create middleware in `packages/harness/deerflow/agents/middlewares/`:
 
 ```python
-# src/agents/middlewares/my_middleware.py
-from langchain.agents.middleware import BaseMiddleware
-from langchain_core.runnables import RunnableConfig
+# packages/harness/deerflow/agents/middlewares/my_middleware.py
+from langchain.agents import AgentState
+from langchain.agents.middleware import AgentMiddleware
+from langgraph.runtime import Runtime
 
-class MyMiddleware(BaseMiddleware):
+class MyMiddleware(AgentMiddleware[AgentState]):
     """Middleware description."""
 
-    def transform_state(self, state: dict, config: RunnableConfig) -> dict:
-        """Transform the state before agent execution."""
-        # Modify state as needed
-        return state
+    def before_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+        """Run before each model call."""
+        print(f"Model input contains {len(state.get('messages', []))} messages")
+        return None
+
+    def after_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+        """Run after each model call."""
+        messages = state.get("messages", [])
+        last_message = messages[-1] if messages else None
+        print(f"Last message type: {type(last_message).__name__ if last_message else 'none'}")
+        return None
 ```
 
-2. Register in `src/agents/lead_agent/agent.py`:
+Lifecycle hooks can return a dictionary of state updates, which LangChain merges
+into the agent state, or `None` when they only observe state.
 
-```python
-middlewares = [
-    ThreadDataMiddleware(),
-    SandboxMiddleware(),
-    MyMiddleware(),  # Add your middleware
-    TitleMiddleware(),
-    ClarificationMiddleware(),
-]
+2. Register the middleware class in `config.yaml`. A class path uses the
+   zero-argument constructor; `{class, kwargs}` passes constructor arguments.
+   `kwargs` values must be JSON types (object, array, string, number, boolean,
+   or null); YAML dates and timestamps are coerced to ISO strings so they match JSON:
+
+```yaml
+extensions:
+  middlewares:
+    - deerflow.agents.middlewares.my_middleware:MyMiddleware
+    - class: deerflow.agents.middlewares.my_middleware:MyMiddleware
+      kwargs:
+        max_tool_calls: 5
 ```
+
+Configured middleware runs after the built-in middleware and optional loop/token
+guards. On the lead-agent pipeline, it runs before the terminal-response,
+model-length, safety, and clarification tail; subagents have no
+terminal-response, model-length, or clarification stage, so configured middleware is
+followed by the optional safety guard, `DurableContextMiddleware`, optional
+`SummarizationMiddleware`, then `SubagentDateContextMiddleware` and
+`SystemMessageCoalescingMiddleware`. Treat middleware class paths as trusted
+operator configuration because loading one executes Python code.
+Embedded callers can instead use `DeerFlowClient(middlewares=[...])`, which
+builds the full lead-agent chain and places middleware before its
+terminal-response, model-length, safety, and clarification tail.
+`create_deerflow_agent(extra_middleware=[...])` instead builds a smaller
+feature-based lead-agent chain; unanchored extras are placed immediately before
+`ClarificationMiddleware` (anchored extras follow their `@Next`/`@Prev`
+placement, but the anchor must be present in this smaller chain). Neither API
+forwards middleware to subagents.
+
+Choose the registration path by ownership and placement. The fixed-slot (not deprecated)
+`extensions.middlewares` list is accepted in `config.yaml` and
+`extensions_config.json` (`config.yaml` wins) and applies to both lead and
+subagent pipelines. Packaged extensions registered through the top-level
+`plugins:` list contribute middleware at semantic extension points. Contributor
+code that needs committed, programmatic lead-only wiring can use
+`build_middlewares(..., custom_middlewares=[MyMiddleware()])` at the
+`build_middlewares` call in
+`packages/harness/deerflow/agents/lead_agent/agent.py` (reached through
+`make_lead_agent`).
 
 ### Adding New API Endpoints
 
-1. Create router in `src/gateway/routers/`:
+1. Create router in `app/gateway/routers/`:
 
 ```python
-# src/gateway/routers/my_router.py
+# app/gateway/routers/my_router.py
 from fastapi import APIRouter
 
 router = APIRouter(prefix="/my-endpoint", tags=["my-endpoint"])
@@ -321,10 +362,10 @@ async def create_item(data: dict):
     return {"created": data}
 ```
 
-2. Register in `src/gateway/app.py`:
+2. Register in `app/gateway/app.py`:
 
 ```python
-from src.gateway.routers import my_router
+from app.gateway.routers import my_router
 
 app.include_router(my_router.router)
 ```
@@ -333,7 +374,7 @@ app.include_router(my_router.router)
 
 When adding new configuration options:
 
-1. Update `src/config/app_config.py` with new fields
+1. Update `packages/harness/deerflow/config/app_config.py` with new fields
 2. Add default values in `config.example.yaml`
 3. Document in `docs/CONFIGURATION.md`
 

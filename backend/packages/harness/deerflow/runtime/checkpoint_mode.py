@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from deerflow.config.database_config import CheckpointChannelMode
+from deerflow.config.database_config import DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY, CheckpointChannelMode
 
 INTERNAL_CHECKPOINT_MODE_KEY = "__deerflow_checkpoint_channel_mode"
 CHECKPOINT_MODE_METADATA_KEY = "deerflow_checkpoint_channel_mode"
@@ -28,6 +28,7 @@ class CheckpointModeReconfigurationError(RuntimeError):
 
 
 _frozen_checkpoint_channel_mode: CheckpointChannelMode | None = None
+_frozen_checkpoint_snapshot_frequency: int | None = None
 
 
 def frozen_checkpoint_channel_mode() -> CheckpointChannelMode | None:
@@ -42,6 +43,39 @@ def freeze_checkpoint_channel_mode(mode: CheckpointChannelMode) -> CheckpointCha
     elif _frozen_checkpoint_channel_mode != mode:
         raise CheckpointModeReconfigurationError("checkpoint_channel_mode is restart-required and cannot change in a running process")
     return _frozen_checkpoint_channel_mode
+
+
+def frozen_checkpoint_snapshot_frequency() -> int | None:
+    """Return the process-frozen delta snapshot frequency, if already frozen."""
+    return _frozen_checkpoint_snapshot_frequency
+
+
+def freeze_checkpoint_snapshot_frequency(snapshot_frequency: int) -> int:
+    """Freeze the delta snapshot cadence alongside the channel mode.
+
+    The cadence is compiled into each graph's channel table, so like the
+    mode it is restart-required and must match across every process sharing
+    one checkpoint database. It is deliberately NOT stamped into checkpoint
+    metadata: the mode marker contract (absence = full) and the full ->
+    delta migration semantics are unchanged by the frequency value.
+    """
+    global _frozen_checkpoint_snapshot_frequency
+    if snapshot_frequency <= 0:
+        raise ValueError("snapshot frequency must be positive")
+    if _frozen_checkpoint_snapshot_frequency is None:
+        _frozen_checkpoint_snapshot_frequency = snapshot_frequency
+    elif _frozen_checkpoint_snapshot_frequency != snapshot_frequency:
+        raise CheckpointModeReconfigurationError("checkpoint_delta.snapshot_frequency is restart-required and cannot change in a running process")
+    return _frozen_checkpoint_snapshot_frequency
+
+
+def resolve_checkpoint_snapshot_frequency(snapshot_frequency: int | None = None) -> int:
+    """Resolve the effective snapshot frequency: explicit value, else the
+    process-frozen value, else the config default."""
+    if snapshot_frequency is not None:
+        return snapshot_frequency
+    frozen = _frozen_checkpoint_snapshot_frequency
+    return frozen if frozen is not None else DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY
 
 
 def inject_checkpoint_mode(config: dict[str, Any], mode: CheckpointChannelMode) -> None:
@@ -89,6 +123,12 @@ def raise_if_snapshot_incompatible(snapshot: Any, mode: CheckpointChannelMode) -
         raise CheckpointModeMismatchError("Thread requires delta mode; materialize and convert its checkpoints before using full mode.")
 
 
+def raise_if_checkpoint_tuple_incompatible(checkpoint_tuple: Any, mode: CheckpointChannelMode) -> None:
+    """Fail closed before exposing raw checkpoint metadata across modes."""
+    if mode == "full" and checkpoint_tuple_uses_delta(checkpoint_tuple):
+        raise CheckpointModeMismatchError("Thread requires delta mode; materialize and convert its checkpoints before using full mode.")
+
+
 def ensure_checkpoint_mode_compatible(checkpointer: Any, config: dict[str, Any], mode: CheckpointChannelMode) -> None:
     """Pre-write gate: a write cannot be un-applied, so it checks ahead of time.
 
@@ -97,12 +137,10 @@ def ensure_checkpoint_mode_compatible(checkpointer: Any, config: dict[str, Any],
     """
     if mode == "delta":
         return
-    if checkpoint_tuple_uses_delta(checkpointer.get_tuple(config)):
-        raise CheckpointModeMismatchError("Thread requires delta mode; materialize and convert its checkpoints before using full mode.")
+    raise_if_checkpoint_tuple_incompatible(checkpointer.get_tuple(config), mode)
 
 
 async def aensure_checkpoint_mode_compatible(checkpointer: Any, config: dict[str, Any], mode: CheckpointChannelMode) -> None:
     if mode == "delta":
         return
-    if checkpoint_tuple_uses_delta(await checkpointer.aget_tuple(config)):
-        raise CheckpointModeMismatchError("Thread requires delta mode; materialize and convert its checkpoints before using full mode.")
+    raise_if_checkpoint_tuple_incompatible(await checkpointer.aget_tuple(config), mode)

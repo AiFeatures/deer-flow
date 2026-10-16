@@ -50,6 +50,7 @@ describe("MarkdownLink rendering", () => {
     expect(html).toContain("<span");
     expect(html).toContain("click me");
     expect(html).not.toContain("href=");
+    expect(html).toContain('aria-label="Unsafe link omitted"');
   });
 
   it("blocks unsafe hrefs before the citation branch", () => {
@@ -76,6 +77,19 @@ describe("MarkdownLink rendering", () => {
     expect(html).toContain('href="https://example.com/report"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');
+  });
+
+  it("renders citation labels when children are React element arrays", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        MarkdownLink,
+        { href: "https://example.com/report" },
+        createElement("span", { key: "prefix" }, "citation:"),
+        createElement("span", { key: "title" }, "Test Source"),
+      ),
+    );
+    expect(html).not.toContain("citation:");
+    expect(html).toContain("Test Source");
   });
 
   it("renders a scheme-less relative href as a navigable anchor", () => {
